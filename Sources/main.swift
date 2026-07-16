@@ -14,8 +14,19 @@ struct UsageEntry {
     let cacheReadTokens: Int
     /// message id + request id; empty when neither is present
     let dedupeKey: String
+    let sessionId: String
+    /// Working directory of the session; last path component is the project name.
+    let cwd: String
+    /// Subagent turns; they bill normally but their context is not the main thread's.
+    let isSidechain: Bool
 
     var totalTokens: Int { inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens }
+    /// Approximate context size of this turn: everything the model was sent.
+    var contextTokens: Int { inputTokens + cacheCreationTokens + cacheReadTokens }
+    var project: String {
+        let name = (cwd as NSString).lastPathComponent
+        return name.isEmpty ? "unknown" : name
+    }
 }
 
 struct Stats {
@@ -179,7 +190,10 @@ final class UsageReader {
                     let msgId = (message["id"] as? String) ?? ""
                     let reqId = (obj["requestId"] as? String) ?? ""
                     return (msgId.isEmpty && reqId.isEmpty) ? "" : msgId + ":" + reqId
-                }()
+                }(),
+                sessionId: (obj["sessionId"] as? String) ?? "",
+                cwd: (obj["cwd"] as? String) ?? "",
+                isSidechain: (obj["isSidechain"] as? Bool) ?? false
             ))
         }
         return out
@@ -201,6 +215,51 @@ struct LimitsSnapshot {
     /// True only when fetching is failing and these are the last good bars —
     /// not merely when they're being reused between polls.
     var stale: Bool
+}
+
+/// Samples each limit's percent over time (persisted across restarts) so we can
+/// estimate when a limit will be hit at the current pace.
+final class LimitTracker {
+    static let shared = LimitTracker()
+    private let key = "limitHistory"
+    private let maxAge: TimeInterval = 3 * 3600
+    private let queue = DispatchQueue(label: "com.mathiasbesil.claude-usage.limittracker")
+    /// label -> [(unix time, percent)]
+    private var series: [String: [[Double]]]
+
+    private init() {
+        series = (UserDefaults.standard.dictionary(forKey: key) as? [String: [[Double]]]) ?? [:]
+    }
+
+    func record(_ bars: [LimitBar], at now: Date) {
+        queue.sync {
+            for bar in bars {
+                var s = series[bar.label] ?? []
+                // A drop in percent means the window reset; old samples are useless.
+                if let last = s.last, bar.percent < last[1] - 0.5 { s = [] }
+                s.append([now.timeIntervalSince1970, bar.percent])
+                s.removeAll { now.timeIntervalSince1970 - $0[0] > maxAge }
+                series[bar.label] = s
+            }
+            UserDefaults.standard.set(series, forKey: key)
+        }
+    }
+
+    /// Projected time the limit reaches 100% at the pace of the last hour, or nil
+    /// when there's too little history, no growth, or the reset comes first.
+    func projectedHit(_ bar: LimitBar, now: Date) -> Date? {
+        let s = queue.sync { series[bar.label] ?? [] }
+        let window = s.filter { now.timeIntervalSince1970 - $0[0] <= 3600 }
+        guard let first = window.first, let last = window.last,
+              last[0] - first[0] >= 10 * 60 else { return nil }
+        let perMin = (last[1] - first[1]) / ((last[0] - first[0]) / 60)
+        guard perMin > 0.05, bar.percent < 100 else { return nil }
+        let minutes = (100 - bar.percent) / perMin
+        guard minutes < 6 * 60 else { return nil }
+        let hit = now.addingTimeInterval(minutes * 60)
+        if let resets = bar.resetsAt, resets <= hit { return nil }
+        return hit
+    }
 }
 
 final class ClaudeAccount {
@@ -418,6 +477,7 @@ final class ClaudeAccount {
 
         UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: "lastUsageJSON")
         let fresh = LimitsSnapshot(bars: Self.parseLimits(obj), fetchedAt: Date(), stale: false)
+        LimitTracker.shared.record(fresh.bars, at: fresh.fetchedAt)
         queue.sync {
             backoff = 0
             fetchFailing = false
@@ -572,11 +632,29 @@ final class ClaudeAccount {
 
 // MARK: - Usage snapshot
 
+struct SessionSummary {
+    let project: String
+    let model: String          // short name of the latest turn's model
+    let lastActivity: Date
+    let contextTokens: Int     // latest turn's prompt size — resent every message
+    let costToday: Double
+}
+
+/// One advisory line for the Insights section.
+struct Insight {
+    enum Severity { case info, warn, alert }
+    let severity: Severity
+    let text: String
+}
+
 struct Snapshot {
     var limits: LimitsSnapshot?    // nil = not signed in / auth failed
     var block: BlockStats?
     var today: Stats
     var week: Stats
+    var sessions: [SessionSummary] = []
+    var insights: [Insight] = []
+    var hourCosts: [Double] = []   // today's cost per hour, index 0 = midnight
 }
 
 enum UsageMath {
@@ -603,15 +681,106 @@ enum UsageMath {
         return b
     }
 
+    /// Sessions with activity in the last 30 minutes, largest context first.
+    static func activeSessions(entries: [UsageEntry], now: Date) -> [SessionSummary] {
+        let dayStart = Calendar.current.startOfDay(for: now)
+        var bySession: [String: [UsageEntry]] = [:]
+        for e in entries where !e.sessionId.isEmpty {
+            bySession[e.sessionId, default: []].append(e)
+        }
+        var out: [SessionSummary] = []
+        for (_, es) in bySession {
+            guard let last = es.last, now.timeIntervalSince(last.timestamp) < 30 * 60 else { continue }
+            // Context = the main thread's latest turn; subagent turns are smaller
+            // side contexts and would understate it.
+            let mainLast = es.last(where: { !$0.isSidechain }) ?? last
+            out.append(SessionSummary(
+                project: last.project,
+                model: Pricing.shortName(mainLast.model),
+                lastActivity: last.timestamp,
+                contextTokens: mainLast.contextTokens,
+                costToday: es.filter { $0.timestamp >= dayStart }.reduce(0) { $0 + Pricing.cost(for: $1) }
+            ))
+        }
+        return Array(out.sorted { $0.contextTokens > $1.contextTokens }.prefix(5))
+    }
+
+    /// Cost rate of the last 15 minutes vs today's average rate.
+    /// Returns (recent $/hr, multiple of today's pace, top project driving it).
+    static func spike(today: [UsageEntry], now: Date) -> (perHour: Double, ratio: Double, driver: String)? {
+        guard let first = today.first else { return nil }
+        let elapsedMin = now.timeIntervalSince(first.timestamp) / 60
+        guard elapsedMin >= 60 else { return nil }   // too early for a meaningful baseline
+        let recent = today.filter { now.timeIntervalSince($0.timestamp) <= 15 * 60 }
+        let recentCost = recent.reduce(0) { $0 + Pricing.cost(for: $1) }
+        guard recentCost >= 1.0 else { return nil }
+        let todayCost = today.reduce(0) { $0 + Pricing.cost(for: $1) }
+        let baselinePerMin = todayCost / elapsedMin
+        let recentPerMin = recentCost / 15
+        guard baselinePerMin > 0, recentPerMin / baselinePerMin >= 2 else { return nil }
+        var byProject: [String: Double] = [:]
+        for e in recent { byProject[e.project, default: 0] += Pricing.cost(for: e) }
+        let driver = byProject.max { $0.value < $1.value }?.key ?? "?"
+        return (recentPerMin * 60, recentPerMin / baselinePerMin, driver)
+    }
+
+    static func insights(sessions: [SessionSummary], today: Stats, limits: [LimitBar],
+                         todayEntries: [UsageEntry], now: Date) -> [Insight] {
+        var out: [Insight] = []
+
+        if let s = spike(today: todayEntries, now: now) {
+            out.append(Insight(severity: s.ratio >= 4 ? .alert : .warn, text: String(
+                format: "Usage spike: ~%@/hr, %.0f× today's pace (%@)", money(s.perHour), s.ratio, s.driver)))
+        }
+
+        for s in sessions where s.contextTokens >= 120_000 {
+            out.append(Insight(
+                severity: s.contextTokens >= 160_000 ? .alert : .warn,
+                text: "\(s.project): context \(compactTokens(s.contextTokens)) — /clear or /compact to cut cost"))
+        }
+
+        let fmt = DateFormatter(); fmt.dateFormat = "HH:mm"
+        for bar in limits {
+            if let hit = LimitTracker.shared.projectedHit(bar, now: now) {
+                out.append(Insight(severity: .warn,
+                    text: "On pace to hit \(bar.label) ~\(fmt.string(from: hit)), before it resets"))
+            }
+        }
+
+        let models = today.byModel
+        if today.cost >= 5, let top = models.first,
+           ["Opus", "Fable", "Mythos"].contains(top.0), top.2 / today.cost >= 0.8, models.count >= 1 {
+            let pct = Int((top.2 / today.cost * 100).rounded())
+            out.append(Insight(severity: .info,
+                text: "\(top.0) is \(pct)% of today's cost — Sonnet/Haiku for lighter tasks stretches limits"))
+        }
+        return out
+    }
+
     static func snapshot(reader: UsageReader, now: Date, forceLimits: Bool = false) -> Snapshot {
         let weekStart = now.addingTimeInterval(-7 * 24 * 3600)
         let all = reader.entries(since: weekStart)
         let dayStart = Calendar.current.startOfDay(for: now)
+        let todayEntries = all.filter { $0.timestamp >= dayStart }
+        let limits = ClaudeAccount.shared.fetchLimits(force: forceLimits)
+        let sessions = activeSessions(entries: all, now: now)
+        let today = Stats(entries: todayEntries)
+
+        var hourCosts = [Double](repeating: 0, count: 24)
+        for e in todayEntries {
+            let h = Calendar.current.component(.hour, from: e.timestamp)
+            hourCosts[h] += Pricing.cost(for: e)
+        }
+
         return Snapshot(
-            limits: ClaudeAccount.shared.fetchLimits(force: forceLimits),
+            limits: limits,
             block: activeBlock(entries: all, now: now),
-            today: Stats(entries: all.filter { $0.timestamp >= dayStart }),
-            week: Stats(entries: all)
+            today: today,
+            week: Stats(entries: all),
+            sessions: sessions,
+            insights: insights(sessions: sessions, today: today, limits: limits?.bars ?? [],
+                               todayEntries: todayEntries, now: now),
+            hourCosts: hourCosts
         )
     }
 
@@ -636,73 +805,143 @@ func timeHM(_ d: Date) -> String {
     let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
 }
 
-// MARK: - Limit bar menu item view
+// MARK: - Limit gauge views
 
-final class LimitBarView: NSView {
-    private let bar: LimitBar
+/// Green / orange / red by how close a percentage is to its limit.
+func limitColor(_ percent: Double) -> NSColor {
+    switch percent {
+    case ..<70: return .systemGreen
+    case ..<90: return .systemOrange
+    default: return .systemRed
+    }
+}
 
-    init(_ bar: LimitBar) {
-        self.bar = bar
-        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 34))
+func shortResetText(_ d: Date) -> String {
+    let interval = d.timeIntervalSinceNow
+    if interval <= 0 { return "resets soon" }
+    if interval < 24 * 3600 {
+        let h = Int(interval) / 3600, m = (Int(interval) % 3600) / 60
+        return h > 0 ? "in \(h)h \(m)m" : "in \(m)m"
+    }
+    let f = DateFormatter()
+    f.dateFormat = "EEE HH:mm"
+    return f.string(from: d)
+}
+
+/// A row of circular progress gauges, one per limit.
+final class RingGaugesView: NSView {
+    private let bars: [LimitBar]
+    private let cellWidth: CGFloat = 90
+
+    init(_ bars: [LimitBar]) {
+        self.bars = bars
+        super.init(frame: NSRect(x: 0, y: 0,
+                                 width: max(280, CGFloat(bars.count) * 90),
+                                 height: 96))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func displayName(_ bar: LimitBar) -> String {
+        if bar.label.hasPrefix("5-hour") { return "5-hour" }
+        if bar.label.hasSuffix("all models") { return "Weekly" }
+        if let dot = bar.label.range(of: " · ") { return String(bar.label[dot.upperBound...]) }
+        return bar.label
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let totalWidth = CGFloat(bars.count) * cellWidth
+        var x = (bounds.width - totalWidth) / 2
+        for bar in bars {
+            drawGauge(bar, in: NSRect(x: x, y: 0, width: cellWidth, height: bounds.height))
+            x += cellWidth
+        }
+    }
+
+    private func drawGauge(_ bar: LimitBar, in rect: NSRect) {
+        let center = NSPoint(x: rect.midX, y: rect.minY + 62)
+        let radius: CGFloat = 24
+        let lineWidth: CGFloat = 5.5
+
+        let track = NSBezierPath()
+        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
+        track.lineWidth = lineWidth
+        NSColor.tertiaryLabelColor.withAlphaComponent(0.25).setStroke()
+        track.stroke()
+
+        let pct = min(max(bar.percent, 0), 100)
+        if pct > 0 {
+            let arc = NSBezierPath()
+            // Start at 12 o'clock and sweep clockwise.
+            arc.appendArc(withCenter: center, radius: radius,
+                          startAngle: 90, endAngle: 90 - 3.6 * pct, clockwise: true)
+            arc.lineWidth = lineWidth
+            arc.lineCapStyle = .round
+            limitColor(pct).setStroke()
+            arc.stroke()
+        }
+
+        func drawCentered(_ s: String, y: CGFloat, attrs: [NSAttributedString.Key: Any]) {
+            let str = s as NSString
+            let w = str.size(withAttributes: attrs).width
+            str.draw(at: NSPoint(x: rect.midX - w / 2, y: y), withAttributes: attrs)
+        }
+
+        drawCentered(String(format: "%.0f%%", bar.percent), y: center.y - 7, attrs: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        drawCentered(displayName(bar), y: rect.minY + 17, attrs: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        if let resets = bar.resetsAt {
+            drawCentered(shortResetText(resets), y: rect.minY + 3, attrs: [
+                .font: NSFont.systemFont(ofSize: 9.5),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+        }
+    }
+}
+
+/// Today's spend by hour as a mini bar chart; the current hour is highlighted.
+final class HourBarsView: NSView {
+    private let costs: [Double]
+    private let currentHour: Int
+
+    init(hourCosts: [Double], now: Date) {
+        // Show midnight through the current hour.
+        self.currentHour = Calendar.current.component(.hour, from: now)
+        self.costs = Array(hourCosts.prefix(currentHour + 1))
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 46))
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func draw(_ dirtyRect: NSRect) {
         let inset: CGFloat = 14
-        let width = bounds.width - inset * 2
+        let chartWidth = bounds.width - inset * 2
+        let maxCost = max(costs.max() ?? 0, 0.01)
+        let barArea: CGFloat = 28
+        let n = max(costs.count, 6)
+        let step = chartWidth / CGFloat(n)
+        let barWidth = max(step - 2, 2)
 
-        let label = bar.label as NSString
-        label.draw(at: NSPoint(x: inset, y: 18), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 12),
-            .foregroundColor: NSColor.labelColor,
-        ])
-
-        var right = String(format: "%.0f%%", bar.percent)
-        if let resets = bar.resetsAt {
-            right = "\(Self.resetText(resets))   \(right)"
+        for (i, c) in costs.enumerated() {
+            guard c > 0 else { continue }
+            let h = max(barArea * CGFloat(c / maxCost), 1.5)
+            let r = NSRect(x: inset + CGFloat(i) * step, y: 4, width: barWidth, height: h)
+            let color: NSColor = i == currentHour ? .controlAccentColor
+                                                  : .controlAccentColor.withAlphaComponent(0.55)
+            color.setFill()
+            NSBezierPath(roundedRect: r, xRadius: 1.5, yRadius: 1.5).fill()
         }
-        let rightStr = right as NSString
+
+        let peak = "peak \(money(maxCost))/h" as NSString
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11),
+            .font: NSFont.systemFont(ofSize: 9.5),
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
-        let rw = rightStr.size(withAttributes: attrs).width
-        rightStr.draw(at: NSPoint(x: bounds.width - inset - rw, y: 19), withAttributes: attrs)
-
-        // track
-        let trackRect = NSRect(x: inset, y: 8, width: width, height: 5)
-        let track = NSBezierPath(roundedRect: trackRect, xRadius: 2.5, yRadius: 2.5)
-        NSColor.tertiaryLabelColor.withAlphaComponent(0.3).setFill()
-        track.fill()
-
-        // fill
-        let pct = min(max(bar.percent, 0), 100) / 100
-        if pct > 0 {
-            let fillRect = NSRect(x: inset, y: 8, width: max(5, width * pct), height: 5)
-            let fill = NSBezierPath(roundedRect: fillRect, xRadius: 2.5, yRadius: 2.5)
-            fillColor().setFill()
-            fill.fill()
-        }
-    }
-
-    private func fillColor() -> NSColor {
-        switch bar.percent {
-        case ..<70: return .controlAccentColor
-        case ..<90: return .systemOrange
-        default: return .systemRed
-        }
-    }
-
-    static func resetText(_ d: Date) -> String {
-        let interval = d.timeIntervalSinceNow
-        if interval <= 0 { return "Resets soon" }
-        if interval < 24 * 3600 {
-            let h = Int(interval) / 3600, m = (Int(interval) % 3600) / 60
-            return h > 0 ? "Resets in \(h) hr \(m) min" : "Resets in \(m) min"
-        }
-        let f = DateFormatter()
-        f.dateFormat = "EEE HH:mm"
-        return "Resets \(f.string(from: d))"
+        let w = peak.size(withAttributes: attrs).width
+        peak.draw(at: NSPoint(x: bounds.width - inset - w, y: bounds.height - 12), withAttributes: attrs)
     }
 }
 
@@ -810,27 +1049,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func render(_ snap: Snapshot, now: Date) {
         let menu = NSMenu()
 
-        // Account limit bars (like claude.ai's usage popup)
+        // Account limit gauges (like claude.ai's usage popup)
         let bars = snap.limits.map { $0.bars } ?? []
+        if bars.isEmpty { statusItem.button?.image = nil }
         if let limits = snap.limits, !bars.isEmpty {
-            statusItem.button?.title = bars
-                .map { String(format: "%@ %.0f%%", $0.shortLabel, $0.percent) }
-                .joined(separator: "  ")
+            setStatusTitle(bars)
 
             menu.addItem(header(limits.stale
                 ? "Plan usage limits  (as of \(timeHM(limits.fetchedAt)))"
                 : "Plan usage limits"))
-            for bar in bars {
-                let item = NSMenuItem()
-                item.view = LimitBarView(bar)
-                menu.addItem(item)
-            }
+            let rings = NSMenuItem()
+            rings.view = RingGaugesView(bars)
+            menu.addItem(rings)
             menu.addItem(.separator())
         } else if snap.limits == nil {
             let s = NSMenuItem(title: "Sign in to Claude for usage limits…",
                                action: #selector(signIn), keyEquivalent: "")
             s.target = self
             menu.addItem(s)
+            menu.addItem(.separator())
+        }
+
+        if !snap.insights.isEmpty {
+            menu.addItem(header("Insights"))
+            for insight in snap.insights {
+                let dotColor: NSColor
+                switch insight.severity {
+                case .info: dotColor = .systemBlue
+                case .warn: dotColor = .systemOrange
+                case .alert: dotColor = .systemRed
+                }
+                menu.addItem(coloredInfo([("● ", dotColor), (insight.text, .labelColor)], size: 12))
+            }
+            menu.addItem(.separator())
+        }
+
+        if !snap.sessions.isEmpty {
+            menu.addItem(header("Active sessions"))
+            for s in snap.sessions {
+                let ctxColor: NSColor = s.contextTokens >= 160_000 ? .systemRed
+                    : s.contextTokens >= 120_000 ? .systemOrange : .secondaryLabelColor
+                menu.addItem(coloredInfo([
+                    ("   \(s.project)", .labelColor),
+                    ("  \(s.model)", .secondaryLabelColor),
+                    ("  ctx \(compactTokens(s.contextTokens))", ctxColor),
+                    ("  \(money(s.costToday)) today", .secondaryLabelColor),
+                ], size: 12))
+            }
             menu.addItem(.separator())
         }
 
@@ -866,6 +1131,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(header("Today"))
         menu.addItem(info("Tokens: \(compactTokens(snap.today.totalTokens))   Cost: \(money(snap.today.cost))"))
+        if snap.today.cost > 0 {
+            let chart = NSMenuItem()
+            chart.view = HourBarsView(hourCosts: snap.hourCosts, now: now)
+            menu.addItem(chart)
+        }
         addModelBreakdown(snap.today, to: menu)
 
         menu.addItem(.separator())
@@ -906,12 +1176,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    private static let modelDots: [String: NSColor] = [
+        "Fable": .systemPurple, "Mythos": .systemPurple, "Opus": .systemIndigo,
+        "Sonnet": .systemBlue, "Haiku": .systemTeal,
+    ]
+
     private func addModelBreakdown(_ s: Stats, to menu: NSMenu) {
         let models = s.byModel
         guard models.count > 1 || (models.first.map { $0.0 != "unknown" } ?? false) else { return }
         for (name, tokens, cost) in models {
-            menu.addItem(info("   \(name): \(compactTokens(tokens)) · \(money(cost))"))
+            menu.addItem(coloredInfo([
+                ("   ● ", Self.modelDots[name] ?? .systemGray),
+                ("\(name): ", .labelColor),
+                ("\(compactTokens(tokens)) · \(money(cost))", .secondaryLabelColor),
+            ], size: 13))
         }
+    }
+
+    /// Sets the status bar to a colored ring for the worst limit plus per-limit
+    /// percentages, each tinted once it approaches its limit.
+    private func setStatusTitle(_ bars: [LimitBar]) {
+        let worst = bars.map { $0.percent }.max() ?? 0
+        statusItem.button?.image = Self.ringIcon(percent: worst)
+        statusItem.button?.imagePosition = .imageLeft
+
+        let title = NSMutableAttributedString()
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        for (i, bar) in bars.enumerated() {
+            if i > 0 { title.append(NSAttributedString(string: "  ")) }
+            // Tint only when worth noticing; default color otherwise so the
+            // status bar stays quiet-looking at normal usage.
+            let color: NSColor = bar.percent >= 70 ? limitColor(bar.percent) : .labelColor
+            title.append(NSAttributedString(
+                string: String(format: "%@ %.0f%%", bar.shortLabel, bar.percent),
+                attributes: [.font: font, .foregroundColor: color, .baselineOffset: -0.5]))
+        }
+        statusItem.button?.attributedTitle = title
+    }
+
+    private static func ringIcon(percent: Double) -> NSImage {
+        let size: CGFloat = 15
+        let img = NSImage(size: NSSize(width: size, height: size))
+        img.lockFocus()
+        let center = NSPoint(x: size / 2, y: size / 2)
+        let radius: CGFloat = 5.5
+        let track = NSBezierPath()
+        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
+        track.lineWidth = 2.5
+        NSColor.tertiaryLabelColor.withAlphaComponent(0.4).setStroke()
+        track.stroke()
+        let pct = min(max(percent, 0), 100)
+        if pct > 0 {
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: center, radius: radius,
+                          startAngle: 90, endAngle: 90 - 3.6 * pct, clockwise: true)
+            arc.lineWidth = 2.5
+            arc.lineCapStyle = .round
+            limitColor(pct).setStroke()
+            arc.stroke()
+        }
+        img.unlockFocus()
+        img.isTemplate = false
+        return img
     }
 
     private func header(_ s: String) -> NSMenuItem {
@@ -920,6 +1246,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return i
     }
     private func info(_ s: String) -> NSMenuItem { NSMenuItem(title: s, action: nil, keyEquivalent: "") }
+
+    private func coloredInfo(_ parts: [(String, NSColor)], size: CGFloat) -> NSMenuItem {
+        let str = NSMutableAttributedString()
+        for (text, color) in parts {
+            str.append(NSAttributedString(string: text, attributes: [
+                .font: NSFont.systemFont(ofSize: size),
+                .foregroundColor: color,
+            ]))
+        }
+        let i = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        i.attributedTitle = str
+        return i
+    }
 }
 
 let app = NSApplication.shared
