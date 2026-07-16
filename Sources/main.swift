@@ -190,6 +190,7 @@ final class UsageReader {
 
 struct LimitBar {
     let label: String
+    let shortLabel: String     // for the menu bar title, e.g. "5h", "W", "F"
     let percent: Double        // 0–100
     let resetsAt: Date?
 }
@@ -366,22 +367,59 @@ final class ClaudeAccount {
         return Self.parseLimits(obj)
     }
 
-    /// Tolerant parser: accepts {key: {utilization, resets_at}} with utilization
-    /// as 0–1 or 0–100, at the top level or nested one dict deep.
+    /// Preferred shape: top-level "limits" array of
+    /// {kind, percent, resets_at, scope:{model:{display_name}}}.
+    static func parseLimitsArray(_ arr: [[String: Any]]) -> [LimitBar] {
+        let iso = ISO8601DateFormatter()
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var out: [LimitBar] = []
+        for item in arr {
+            guard let percent = item["percent"] as? Double else { continue }
+            let kind = (item["kind"] as? String) ?? ""
+            let scopeName = ((item["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+            let label: String
+            let short: String
+            switch kind {
+            case "session": label = "5-hour limit"; short = "5h"
+            case "weekly_all": label = "Weekly · all models"; short = "W"
+            case "weekly_scoped":
+                let name = scopeName ?? "scoped"
+                label = "Weekly · \(name)"
+                short = String(name.prefix(1))
+            default:
+                label = kind.replacingOccurrences(of: "_", with: " ")
+                short = String(label.prefix(1))
+            }
+            var resets: Date? = nil
+            if let s = item["resets_at"] as? String {
+                resets = isoFrac.date(from: s) ?? iso.date(from: s)
+            }
+            out.append(LimitBar(label: label, shortLabel: short, percent: percent, resetsAt: resets))
+        }
+        return out
+    }
+
+    /// Tolerant fallback parser: accepts {key: {utilization, resets_at}} with
+    /// utilization as 0–1 or 0–100, at the top level or nested one dict deep.
     static func parseLimits(_ obj: [String: Any]) -> [LimitBar] {
-        let labels: [(String, String)] = [
-            ("five_hour", "5-hour limit"),
-            ("seven_day", "Weekly · all models"),
-            ("seven_day_sonnet", "Weekly · Sonnet"),
-            ("seven_day_opus", "Weekly · Opus"),
-            ("seven_day_fable", "Weekly · Fable"),
-            ("seven_day_oauth_apps", "Weekly · OAuth apps"),
+        if let arr = obj["limits"] as? [[String: Any]] {
+            let bars = parseLimitsArray(arr)
+            if !bars.isEmpty { return bars }
+        }
+        let labels: [(String, String, String)] = [
+            ("five_hour", "5-hour limit", "5h"),
+            ("seven_day", "Weekly · all models", "W"),
+            ("seven_day_sonnet", "Weekly · Sonnet", "S"),
+            ("seven_day_opus", "Weekly · Opus", "O"),
+            ("seven_day_fable", "Weekly · Fable", "F"),
+            ("seven_day_oauth_apps", "Weekly · OAuth apps", "A"),
         ]
         let iso = ISO8601DateFormatter()
         let isoFrac = ISO8601DateFormatter()
         isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
-        func bar(_ key: String, _ label: String, _ dict: [String: Any]) -> LimitBar? {
+        func bar(_ key: String, _ label: String, _ short: String, _ dict: [String: Any]) -> LimitBar? {
             guard let raw = dict["utilization"] as? Double else { return nil }
             let pct = raw <= 1.0 ? raw * 100 : raw
             var resets: Date? = nil
@@ -390,22 +428,24 @@ final class ClaudeAccount {
             } else if let n = dict["resets_at"] as? Double {
                 resets = Date(timeIntervalSince1970: n > 1e12 ? n / 1000 : n)
             }
-            return LimitBar(label: label, percent: pct, resetsAt: resets)
+            return LimitBar(label: label, shortLabel: short, percent: pct, resetsAt: resets)
         }
 
         func scan(_ dict: [String: Any]) -> [LimitBar] {
             var out: [LimitBar] = []
-            for (key, label) in labels {
-                if let sub = dict[key] as? [String: Any], let b = bar(key, label, sub) {
+            for (key, label, short) in labels {
+                if let sub = dict[key] as? [String: Any], let b = bar(key, label, short, sub) {
                     out.append(b)
                 }
             }
             // unknown keys with the same shape (future limits)
             let known = Set(labels.map { $0.0 })
             for (key, val) in dict {
-                if !known.contains(key), let sub = val as? [String: Any],
-                   let b = bar(key, key.replacingOccurrences(of: "_", with: " "), sub) {
-                    out.append(b)
+                if !known.contains(key), let sub = val as? [String: Any] {
+                    let label = key.replacingOccurrences(of: "_", with: " ")
+                    if let b = bar(key, label, String(label.prefix(1)), sub) {
+                        out.append(b)
+                    }
                 }
             }
             return out
@@ -687,8 +727,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Account limit bars (like claude.ai's usage popup)
         if let limits = snap.limits, !limits.isEmpty {
-            let fiveHour = limits.first { $0.label.hasPrefix("5-hour") } ?? limits[0]
-            statusItem.button?.title = String(format: "CC %.0f%%", fiveHour.percent)
+            statusItem.button?.title = limits
+                .map { String(format: "%@ %.0f%%", $0.shortLabel, $0.percent) }
+                .joined(separator: "  ")
 
             menu.addItem(header("Plan usage limits"))
             for bar in limits {
