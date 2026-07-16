@@ -8,11 +8,16 @@ from the transcript logs in `~/.claude/projects` — no credentials, no network.
 
 **Dropdown menu:**
 - Current 5h block: token breakdown (input / output / cache write / cache read),
-  estimated cost, burn rate, and time until the block resets
-- Today's totals
+  estimated cost, burn rate, time until the block resets, per-model breakdown
+- Today's totals with per-model breakdown
+- Last 7 days totals
+- "Menu bar shows" — choose tokens, cost, or both in the status bar title
+- Launch at login toggle
 - Refresh / Quit
 
-Data refreshes automatically every 60 seconds.
+Data refreshes automatically every 60 seconds. Files are parsed once and
+cached by (mtime, size), so the first refresh scans a week of logs and later
+refreshes only re-read files that changed.
 
 ## Build & run
 
