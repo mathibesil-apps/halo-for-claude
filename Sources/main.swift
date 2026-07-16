@@ -222,7 +222,7 @@ enum UsageMath {
         let all = reader.entries(since: weekStart)
         let dayStart = Calendar.current.startOfDay(for: now)
         return Snapshot(
-            block: activeBlock(entries: all.filter { $0.timestamp >= now.addingTimeInterval(-10 * 3600) }, now: now),
+            block: activeBlock(entries: all, now: now),
             today: Stats(entries: all.filter { $0.timestamp >= dayStart }),
             week: Stats(entries: all)
         )
@@ -255,6 +255,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let reader = UsageReader()
     private var timer: Timer?
+    // UsageReader's cache is not thread-safe; all refreshes go through this serial queue.
+    private let refreshQueue = DispatchQueue(label: "com.mathiasbesil.claude-usage.refresh", qos: .utility)
 
     private enum TitleMode: String, CaseIterable {
         case both, tokens, cost
@@ -303,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        refreshQueue.async { [weak self] in
             guard let self else { return }
             let now = Date()
             let snap = UsageMath.snapshot(reader: self.reader, now: now)
