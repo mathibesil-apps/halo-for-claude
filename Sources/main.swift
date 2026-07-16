@@ -195,6 +195,14 @@ struct LimitBar {
     let resetsAt: Date?
 }
 
+struct LimitsSnapshot {
+    var bars: [LimitBar]
+    var fetchedAt: Date
+    /// True only when fetching is failing and these are the last good bars —
+    /// not merely when they're being reused between polls.
+    var stale: Bool
+}
+
 final class ClaudeAccount {
     static let shared = ClaudeAccount()
     private let clientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -209,6 +217,21 @@ final class ClaudeAccount {
     }
     private var pendingVerifier: String?
     private var pendingState: String?
+
+    /// Last successful limits, reused while a fetch is failing or rate-limited.
+    private var cachedLimits: LimitsSnapshot?
+    /// Hard gate: never send a request before this, not even for a manual refresh.
+    /// Holds the 429 backoff, and a short floor that stops a held-down ⌘R from
+    /// bursting requests at the endpoint.
+    private var nextFetchAllowed = Date.distantPast
+    /// Soft gate: the routine polling interval, which a manual refresh may skip.
+    private var nextPoll = Date.distantPast
+    private var backoff: TimeInterval = 0
+    /// Whether the last attempted fetch failed; drives the stale marker.
+    private var fetchFailing = false
+    private let fetchFloor: TimeInterval = 5
+    private let pollInterval: TimeInterval = 120
+    private let maxBackoff: TimeInterval = 15 * 60
 
     // MARK: Keychain
 
@@ -308,7 +331,7 @@ final class ClaudeAccount {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let (data, status) = Self.syncRequest(req)
+        let (data, status, _) = Self.syncRequest(req)
         guard let data, status == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let access = obj["access_token"] as? String else {
@@ -351,20 +374,77 @@ final class ClaudeAccount {
 
     // MARK: Usage limits
 
-    /// nil = not signed in / auth failed; empty = signed in but response unrecognized.
-    func fetchLimits() -> [LimitBar]? {
+    /// nil = not signed in / auth failed. On a transient failure the previous good
+    /// limits are returned marked stale, so the menu bar keeps showing percentages
+    /// instead of silently dropping to the local-log fallback.
+    func fetchLimits(force: Bool = false) -> LimitsSnapshot? {
+        guard isSignedIn else {
+            queue.sync { cachedLimits = nil }
+            return nil
+        }
+        let now = Date()
+        let (cached, gated, failing) = queue.sync {
+            (cachedLimits, now < nextFetchAllowed || (!force && now < nextPoll), fetchFailing)
+        }
+        if gated {
+            // No cached bars yet just means "signed in, nothing fetched" — still not
+            // a reason to send a request we know is gated.
+            return cached.map { LimitsSnapshot(bars: $0.bars, fetchedAt: $0.fetchedAt, stale: failing) }
+                ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: failing)
+        }
         guard let token = validAccessToken() else { return nil }
+
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        let (data, status) = Self.syncRequest(req)
+        let (data, status, headers) = Self.syncRequest(req)
+
+        if status == 401 || status == 403 {
+            NSLog("usage fetch unauthorized (HTTP \(status))")
+            return nil
+        }
         guard let data, status == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            NSLog("usage fetch failed (HTTP \(status))")
-            return status == 401 || status == 403 ? nil : []
+            let body = (data.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(200)
+            let wait = max(Self.retryAfter(headers) ?? 0, backOff())
+            queue.sync {
+                fetchFailing = true
+                nextFetchAllowed = Date().addingTimeInterval(wait)
+                nextPoll = nextFetchAllowed
+            }
+            NSLog("usage fetch failed (HTTP \(status)), retrying in \(Int(wait))s: \(body)")
+            return cached.map { LimitsSnapshot(bars: $0.bars, fetchedAt: $0.fetchedAt, stale: true) }
         }
+
         UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: "lastUsageJSON")
-        return Self.parseLimits(obj)
+        let fresh = LimitsSnapshot(bars: Self.parseLimits(obj), fetchedAt: Date(), stale: false)
+        queue.sync {
+            backoff = 0
+            fetchFailing = false
+            nextFetchAllowed = Date().addingTimeInterval(fetchFloor)
+            nextPoll = Date().addingTimeInterval(pollInterval)
+            if !fresh.bars.isEmpty { cachedLimits = fresh }
+        }
+        // An unrecognized-but-successful response shouldn't discard good bars.
+        if fresh.bars.isEmpty, let cached {
+            return LimitsSnapshot(bars: cached.bars, fetchedAt: cached.fetchedAt, stale: true)
+        }
+        return fresh
+    }
+
+    /// Doubles the backoff from `pollInterval` up to `maxBackoff`.
+    private func backOff() -> TimeInterval {
+        queue.sync {
+            backoff = backoff == 0 ? pollInterval : min(backoff * 2, maxBackoff)
+            return backoff
+        }
+    }
+
+    private static func retryAfter(_ headers: [AnyHashable: Any]) -> TimeInterval? {
+        for (k, v) in headers where (k as? String)?.lowercased() == "retry-after" {
+            if let s = v as? String, let secs = TimeInterval(s) { return max(secs, 1) }
+        }
+        return nil
     }
 
     /// Preferred shape: top-level "limits" array of
@@ -464,17 +544,20 @@ final class ClaudeAccount {
 
     // MARK: Helpers
 
-    private static func syncRequest(_ req: URLRequest) -> (Data?, Int) {
+    private static func syncRequest(_ req: URLRequest) -> (Data?, Int, [AnyHashable: Any]) {
         var outData: Data?
         var outStatus = 0
+        var outHeaders: [AnyHashable: Any] = [:]
         let sem = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: req) { data, resp, _ in
             outData = data
-            outStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let http = resp as? HTTPURLResponse
+            outStatus = http?.statusCode ?? 0
+            outHeaders = http?.allHeaderFields ?? [:]
             sem.signal()
         }.resume()
         sem.wait()
-        return (outData, outStatus)
+        return (outData, outStatus, outHeaders)
     }
 
     private static func randomURLSafe(_ len: Int) -> String {
@@ -490,7 +573,7 @@ final class ClaudeAccount {
 // MARK: - Usage snapshot
 
 struct Snapshot {
-    var limits: [LimitBar]?    // nil = not signed in / auth failed
+    var limits: LimitsSnapshot?    // nil = not signed in / auth failed
     var block: BlockStats?
     var today: Stats
     var week: Stats
@@ -520,12 +603,12 @@ enum UsageMath {
         return b
     }
 
-    static func snapshot(reader: UsageReader, now: Date) -> Snapshot {
+    static func snapshot(reader: UsageReader, now: Date, forceLimits: Bool = false) -> Snapshot {
         let weekStart = now.addingTimeInterval(-7 * 24 * 3600)
         let all = reader.entries(since: weekStart)
         let dayStart = Calendar.current.startOfDay(for: now)
         return Snapshot(
-            limits: ClaudeAccount.shared.fetchLimits(),
+            limits: ClaudeAccount.shared.fetchLimits(force: forceLimits),
             block: activeBlock(entries: all, now: now),
             today: Stats(entries: all.filter { $0.timestamp >= dayStart }),
             week: Stats(entries: all)
@@ -655,7 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
-    @objc private func refreshClicked() { refresh() }
+    @objc private func refreshClicked() { refresh(forceLimits: true) }
     @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func setTitleMode(_ sender: NSMenuItem) {
@@ -689,7 +772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     fail.informativeText = error
                     fail.runModal()
                 } else {
-                    self?.refresh()
+                    self?.refresh(forceLimits: true)
                 }
             }
         }
@@ -713,11 +796,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    private func refresh() {
+    /// `forceLimits` bypasses the limits-fetch rate limit; only user-initiated
+    /// refreshes set it, so the 60s timer can't hammer the endpoint into a 429.
+    private func refresh(forceLimits: Bool = false) {
         refreshQueue.async { [weak self] in
             guard let self else { return }
             let now = Date()
-            let snap = UsageMath.snapshot(reader: self.reader, now: now)
+            let snap = UsageMath.snapshot(reader: self.reader, now: now, forceLimits: forceLimits)
             DispatchQueue.main.async { self.render(snap, now: now) }
         }
     }
@@ -726,13 +811,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         // Account limit bars (like claude.ai's usage popup)
-        if let limits = snap.limits, !limits.isEmpty {
-            statusItem.button?.title = limits
+        let bars = snap.limits.map { $0.bars } ?? []
+        if let limits = snap.limits, !bars.isEmpty {
+            statusItem.button?.title = bars
                 .map { String(format: "%@ %.0f%%", $0.shortLabel, $0.percent) }
                 .joined(separator: "  ")
 
-            menu.addItem(header("Plan usage limits"))
-            for bar in limits {
+            menu.addItem(header(limits.stale
+                ? "Plan usage limits  (as of \(timeHM(limits.fetchedAt)))"
+                : "Plan usage limits"))
+            for bar in bars {
                 let item = NSMenuItem()
                 item.view = LimitBarView(bar)
                 menu.addItem(item)
@@ -748,7 +836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let b = snap.block {
             let s = b.stats
-            if snap.limits == nil || snap.limits!.isEmpty {
+            if bars.isEmpty {
                 switch titleMode {
                 case .both: statusItem.button?.title = "CC \(compactTokens(s.totalTokens)) · \(money(s.cost))"
                 case .tokens: statusItem.button?.title = "CC \(compactTokens(s.totalTokens))"
@@ -769,7 +857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             addModelBreakdown(s, to: menu)
         } else {
-            if snap.limits == nil || snap.limits!.isEmpty {
+            if bars.isEmpty {
                 statusItem.button?.title = "CC idle"
             }
             menu.addItem(header("No active 5h block"))
