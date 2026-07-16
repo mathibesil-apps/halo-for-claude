@@ -154,9 +154,14 @@ final class UsageReader {
         }
 
         // Dedupe across files (same message can appear in resumed/forked sessions).
+        // Tiebreak equal timestamps by dedupeKey so the surviving copy — and thus
+        // which session's stats it lands in — is deterministic across refreshes.
         var deduped: [UsageEntry] = []
         deduped.reserveCapacity(result.count)
-        for e in result.sorted(by: { $0.timestamp < $1.timestamp }) {
+        let sorted = result.sorted {
+            $0.timestamp == $1.timestamp ? $0.dedupeKey < $1.dedupeKey : $0.timestamp < $1.timestamp
+        }
+        for e in sorted {
             if e.dedupeKey.isEmpty || seen.insert(e.dedupeKey).inserted {
                 deduped.append(e)
             }
@@ -203,10 +208,27 @@ final class UsageReader {
 // MARK: - Claude account OAuth (own token, stored in this app's Keychain item)
 
 struct LimitBar {
+    let kind: String           // stable identity from the API, e.g. "session", "weekly_all"
+    let scopeName: String?     // model display name for scoped limits
     let label: String
     let shortLabel: String     // for the menu bar title, e.g. "5h", "W", "F"
     let percent: Double        // 0–100
     let resetsAt: Date?
+
+    /// Persistence key for history tracking; stable across label wording changes.
+    var trackerKey: String { scopeName.map { "\(kind):\($0)" } ?? kind }
+
+    /// Short name under a ring gauge.
+    var displayName: String {
+        switch kind {
+        case "session", "five_hour": return "5-hour"
+        case "weekly_all", "seven_day": return "Weekly"
+        default:
+            if let scopeName { return scopeName }
+            if let dot = label.range(of: " · ") { return String(label[dot.upperBound...]) }
+            return label
+        }
+    }
 }
 
 struct LimitsSnapshot {
@@ -215,6 +237,10 @@ struct LimitsSnapshot {
     /// True only when fetching is failing and these are the last good bars —
     /// not merely when they're being reused between polls.
     var stale: Bool
+
+    func markedStale(_ flag: Bool = true) -> LimitsSnapshot {
+        var s = self; s.stale = flag; return s
+    }
 }
 
 /// Samples each limit's percent over time (persisted across restarts) so we can
@@ -224,7 +250,7 @@ final class LimitTracker {
     private let key = "limitHistory"
     private let maxAge: TimeInterval = 3 * 3600
     private let queue = DispatchQueue(label: "com.mathiasbesil.claude-usage.limittracker")
-    /// label -> [(unix time, percent)]
+    /// trackerKey -> [(unix time, percent)]
     private var series: [String: [[Double]]]
 
     private init() {
@@ -233,13 +259,16 @@ final class LimitTracker {
 
     func record(_ bars: [LimitBar], at now: Date) {
         queue.sync {
+            // Drop series for limits the API no longer reports.
+            let liveKeys = Set(bars.map { $0.trackerKey })
+            series = series.filter { liveKeys.contains($0.key) }
             for bar in bars {
-                var s = series[bar.label] ?? []
+                var s = series[bar.trackerKey] ?? []
                 // A drop in percent means the window reset; old samples are useless.
                 if let last = s.last, bar.percent < last[1] - 0.5 { s = [] }
                 s.append([now.timeIntervalSince1970, bar.percent])
                 s.removeAll { now.timeIntervalSince1970 - $0[0] > maxAge }
-                series[bar.label] = s
+                series[bar.trackerKey] = s
             }
             UserDefaults.standard.set(series, forKey: key)
         }
@@ -248,7 +277,7 @@ final class LimitTracker {
     /// Projected time the limit reaches 100% at the pace of the last hour, or nil
     /// when there's too little history, no growth, or the reset comes first.
     func projectedHit(_ bar: LimitBar, now: Date) -> Date? {
-        let s = queue.sync { series[bar.label] ?? [] }
+        let s = queue.sync { series[bar.trackerKey] ?? [] }
         let window = s.filter { now.timeIntervalSince1970 - $0[0] <= 3600 }
         guard let first = window.first, let last = window.last,
               last[0] - first[0] >= 10 * 60 else { return nil }
@@ -324,6 +353,18 @@ final class ClaudeAccount {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
         ] as CFDictionary)
+        resetFetchState()
+    }
+
+    /// Clears cache, backoff, and gates — auth state changed, old pacing is moot.
+    private func resetFetchState() {
+        queue.sync {
+            cachedLimits = nil
+            backoff = 0
+            fetchFailing = false
+            nextFetchAllowed = .distantPast
+            nextPoll = .distantPast
+        }
     }
 
     var isSignedIn: Bool { loadTokens() != nil }
@@ -377,13 +418,20 @@ final class ClaudeAccount {
             saveTokens(t)
             pendingVerifier = nil
             pendingState = nil
+            resetFetchState()
             return nil
         case .failure(let err):
             return err.message
         }
     }
 
-    private struct OAuthError: Error { let message: String }
+    private struct OAuthError: Error {
+        let message: String
+        let status: Int
+        /// True when the server rejected the credentials themselves, as opposed
+        /// to a network blip / outage / rate limit.
+        var isAuthRejection: Bool { (400...403).contains(status) }
+    }
 
     private func postToken(body: inout [String: Any]) -> Result<Tokens, OAuthError> {
         var req = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
@@ -395,7 +443,8 @@ final class ClaudeAccount {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let access = obj["access_token"] as? String else {
             let detail = (data.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(200)
-            return .failure(OAuthError(message: "Token request failed (HTTP \(status)): \(detail)"))
+            return .failure(OAuthError(message: "Token request failed (HTTP \(status)): \(detail)",
+                                       status: status))
         }
         let expiresIn = (obj["expires_in"] as? Double) ?? 3600
         return .success(Tokens(
@@ -407,11 +456,17 @@ final class ClaudeAccount {
 
     // MARK: Access token with refresh
 
-    private func validAccessToken() -> String? {
-        queue.sync { () -> String? in
-            guard var t = loadTokens() else { return nil }
-            if t.expiresAt > Date() { return t.accessToken }
-            guard !t.refreshToken.isEmpty else { return nil }
+    private enum TokenResult {
+        case valid(String)
+        case transient      // network blip / outage — credentials may still be fine
+        case unauthorized   // no tokens, or the server rejected them
+    }
+
+    private func validAccessToken() -> TokenResult {
+        queue.sync { () -> TokenResult in
+            guard var t = loadTokens() else { return .unauthorized }
+            if t.expiresAt > Date() { return .valid(t.accessToken) }
+            guard !t.refreshToken.isEmpty else { return .unauthorized }
             var body: [String: Any] = [
                 "grant_type": "refresh_token",
                 "refresh_token": t.refreshToken,
@@ -423,10 +478,10 @@ final class ClaudeAccount {
                 if merged.refreshToken.isEmpty { merged.refreshToken = t.refreshToken }
                 saveTokens(merged)
                 t = merged
-                return t.accessToken
+                return .valid(t.accessToken)
             case .failure(let err):
                 NSLog("token refresh failed: \(err.message)")
-                return nil
+                return err.isAuthRejection ? .unauthorized : .transient
             }
         }
     }
@@ -448,10 +503,23 @@ final class ClaudeAccount {
         if gated {
             // No cached bars yet just means "signed in, nothing fetched" — still not
             // a reason to send a request we know is gated.
-            return cached.map { LimitsSnapshot(bars: $0.bars, fetchedAt: $0.fetchedAt, stale: failing) }
+            return cached?.markedStale(failing)
                 ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: failing)
         }
-        guard let token = validAccessToken() else { return nil }
+
+        let token: String
+        switch validAccessToken() {
+        case .unauthorized:
+            return nil
+        case .transient:
+            // Credentials are probably fine; keep showing the last good bars and
+            // back off the polling instead of hammering the token endpoint.
+            noteFailure(status: 0, headers: [:], detail: "token refresh unreachable")
+            return cached?.markedStale()
+                ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: true)
+        case .valid(let t):
+            token = t
+        }
 
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -465,31 +533,42 @@ final class ClaudeAccount {
         guard let data, status == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             let body = (data.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(200)
-            let wait = max(Self.retryAfter(headers) ?? 0, backOff())
-            queue.sync {
-                fetchFailing = true
-                nextFetchAllowed = Date().addingTimeInterval(wait)
-                nextPoll = nextFetchAllowed
-            }
-            NSLog("usage fetch failed (HTTP \(status)), retrying in \(Int(wait))s: \(body)")
-            return cached.map { LimitsSnapshot(bars: $0.bars, fetchedAt: $0.fetchedAt, stale: true) }
+            noteFailure(status: status, headers: headers, detail: "HTTP \(status): \(body)")
+            return cached?.markedStale()
+                ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: true)
         }
 
         UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: "lastUsageJSON")
         let fresh = LimitsSnapshot(bars: Self.parseLimits(obj), fetchedAt: Date(), stale: false)
-        LimitTracker.shared.record(fresh.bars, at: fresh.fetchedAt)
         queue.sync {
             backoff = 0
-            fetchFailing = false
+            // A 200 whose shape we can't parse is still a failure to get data;
+            // keep the stale marker on so the menu shows "as of HH:MM".
+            fetchFailing = fresh.bars.isEmpty
             nextFetchAllowed = Date().addingTimeInterval(fetchFloor)
             nextPoll = Date().addingTimeInterval(pollInterval)
             if !fresh.bars.isEmpty { cachedLimits = fresh }
         }
-        // An unrecognized-but-successful response shouldn't discard good bars.
-        if fresh.bars.isEmpty, let cached {
-            return LimitsSnapshot(bars: cached.bars, fetchedAt: cached.fetchedAt, stale: true)
+        guard !fresh.bars.isEmpty else {
+            // An unrecognized-but-successful response shouldn't discard good bars.
+            return cached?.markedStale()
+                ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: true)
         }
+        LimitTracker.shared.record(fresh.bars, at: fresh.fetchedAt)
         return fresh
+    }
+
+    /// Records a transient failure: polling backs off (exponentially, honoring
+    /// Retry-After), but only an actual 429 hard-gates user-initiated refreshes —
+    /// for other failures a manual retry after `fetchFloor` is harmless.
+    private func noteFailure(status: Int, headers: [AnyHashable: Any], detail: String) {
+        let wait = max(Self.retryAfter(headers) ?? 0, backOff())
+        queue.sync {
+            fetchFailing = true
+            nextPoll = Date().addingTimeInterval(wait)
+            nextFetchAllowed = Date().addingTimeInterval(status == 429 ? min(wait, 3600) : fetchFloor)
+        }
+        NSLog("usage fetch failed (\(detail)), retrying in \(Int(wait))s")
     }
 
     /// Doubles the backoff from `pollInterval` up to `maxBackoff`.
@@ -535,7 +614,8 @@ final class ClaudeAccount {
             if let s = item["resets_at"] as? String {
                 resets = isoFrac.date(from: s) ?? iso.date(from: s)
             }
-            out.append(LimitBar(label: label, shortLabel: short, percent: percent, resetsAt: resets))
+            out.append(LimitBar(kind: kind, scopeName: scopeName, label: label,
+                                shortLabel: short, percent: percent, resetsAt: resets))
         }
         return out
     }
@@ -568,7 +648,8 @@ final class ClaudeAccount {
             } else if let n = dict["resets_at"] as? Double {
                 resets = Date(timeIntervalSince1970: n > 1e12 ? n / 1000 : n)
             }
-            return LimitBar(label: label, shortLabel: short, percent: pct, resetsAt: resets)
+            return LimitBar(kind: key, scopeName: nil, label: label,
+                            shortLabel: short, percent: pct, resetsAt: resets)
         }
 
         func scan(_ dict: [String: Any]) -> [LimitBar] {
@@ -635,7 +716,6 @@ final class ClaudeAccount {
 struct SessionSummary {
     let project: String
     let model: String          // short name of the latest turn's model
-    let lastActivity: Date
     let contextTokens: Int     // latest turn's prompt size — resent every message
     let costToday: Double
 }
@@ -645,6 +725,15 @@ struct Insight {
     enum Severity { case info, warn, alert }
     let severity: Severity
     let text: String
+
+    /// Context sizes worth flagging — the whole context is re-sent every turn.
+    static func contextSeverity(_ tokens: Int) -> Severity? {
+        switch tokens {
+        case 160_000...: return .alert
+        case 120_000...: return .warn
+        default: return nil
+        }
+    }
 }
 
 struct Snapshot {
@@ -682,44 +771,62 @@ enum UsageMath {
     }
 
     /// Sessions with activity in the last 30 minutes, largest context first.
+    /// Single pass; entries must be in chronological order.
     static func activeSessions(entries: [UsageEntry], now: Date) -> [SessionSummary] {
         let dayStart = Calendar.current.startOfDay(for: now)
-        var bySession: [String: [UsageEntry]] = [:]
+        struct Acc {
+            var last: UsageEntry
+            var lastMain: UsageEntry?  // latest non-sidechain turn
+            var costToday: Double
+        }
+        var bySession: [String: Acc] = [:]
         for e in entries where !e.sessionId.isEmpty {
-            bySession[e.sessionId, default: []].append(e)
+            let cost = e.timestamp >= dayStart ? Pricing.cost(for: e) : 0
+            if var a = bySession[e.sessionId] {
+                a.last = e
+                if !e.isSidechain { a.lastMain = e }
+                a.costToday += cost
+                bySession[e.sessionId] = a
+            } else {
+                bySession[e.sessionId] = Acc(last: e, lastMain: e.isSidechain ? nil : e, costToday: cost)
+            }
         }
         var out: [SessionSummary] = []
-        for (_, es) in bySession {
-            guard let last = es.last, now.timeIntervalSince(last.timestamp) < 30 * 60 else { continue }
+        for (_, a) in bySession {
+            guard now.timeIntervalSince(a.last.timestamp) < 30 * 60 else { continue }
             // Context = the main thread's latest turn; subagent turns are smaller
             // side contexts and would understate it.
-            let mainLast = es.last(where: { !$0.isSidechain }) ?? last
+            let mainLast = a.lastMain ?? a.last
             out.append(SessionSummary(
-                project: last.project,
+                project: a.last.project,
                 model: Pricing.shortName(mainLast.model),
-                lastActivity: last.timestamp,
                 contextTokens: mainLast.contextTokens,
-                costToday: es.filter { $0.timestamp >= dayStart }.reduce(0) { $0 + Pricing.cost(for: $1) }
+                costToday: a.costToday
             ))
         }
         return Array(out.sorted { $0.contextTokens > $1.contextTokens }.prefix(5))
     }
 
-    /// Cost rate of the last 15 minutes vs today's average rate.
+    /// Cost rate of the last 15 minutes vs the rest of today's average rate.
     /// Returns (recent $/hr, multiple of today's pace, top project driving it).
-    static func spike(today: [UsageEntry], now: Date) -> (perHour: Double, ratio: Double, driver: String)? {
+    static func spike(today: [UsageEntry], todayCost: Double, now: Date)
+        -> (perHour: Double, ratio: Double, driver: String)? {
         guard let first = today.first else { return nil }
         let elapsedMin = now.timeIntervalSince(first.timestamp) / 60
         guard elapsedMin >= 60 else { return nil }   // too early for a meaningful baseline
-        let recent = today.filter { now.timeIntervalSince($0.timestamp) <= 15 * 60 }
-        let recentCost = recent.reduce(0) { $0 + Pricing.cost(for: $1) }
+        var recentCost = 0.0
+        var byProject: [String: Double] = [:]
+        for e in today where now.timeIntervalSince(e.timestamp) <= 15 * 60 {
+            let c = Pricing.cost(for: e)
+            recentCost += c
+            byProject[e.project, default: 0] += c
+        }
         guard recentCost >= 1.0 else { return nil }
-        let todayCost = today.reduce(0) { $0 + Pricing.cost(for: $1) }
-        let baselinePerMin = todayCost / elapsedMin
+        // Exclude the window under test from its own baseline, otherwise a real
+        // burst inflates the baseline and understates the ratio.
+        let baselinePerMin = (todayCost - recentCost) / (elapsedMin - 15)
         let recentPerMin = recentCost / 15
         guard baselinePerMin > 0, recentPerMin / baselinePerMin >= 2 else { return nil }
-        var byProject: [String: Double] = [:]
-        for e in recent { byProject[e.project, default: 0] += Pricing.cost(for: e) }
         let driver = byProject.max { $0.value < $1.value }?.key ?? "?"
         return (recentPerMin * 60, recentPerMin / baselinePerMin, driver)
     }
@@ -727,30 +834,31 @@ enum UsageMath {
     static func insights(sessions: [SessionSummary], today: Stats, limits: [LimitBar],
                          todayEntries: [UsageEntry], now: Date) -> [Insight] {
         var out: [Insight] = []
+        let todayCost = today.cost
 
-        if let s = spike(today: todayEntries, now: now) {
+        if let s = spike(today: todayEntries, todayCost: todayCost, now: now) {
             out.append(Insight(severity: s.ratio >= 4 ? .alert : .warn, text: String(
                 format: "Usage spike: ~%@/hr, %.0f× today's pace (%@)", money(s.perHour), s.ratio, s.driver)))
         }
 
-        for s in sessions where s.contextTokens >= 120_000 {
-            out.append(Insight(
-                severity: s.contextTokens >= 160_000 ? .alert : .warn,
-                text: "\(s.project): context \(compactTokens(s.contextTokens)) — /clear or /compact to cut cost"))
+        for s in sessions {
+            if let severity = Insight.contextSeverity(s.contextTokens) {
+                out.append(Insight(severity: severity,
+                    text: "\(s.project): context \(compactTokens(s.contextTokens)) — /clear or /compact to cut cost"))
+            }
         }
 
-        let fmt = DateFormatter(); fmt.dateFormat = "HH:mm"
         for bar in limits {
             if let hit = LimitTracker.shared.projectedHit(bar, now: now) {
                 out.append(Insight(severity: .warn,
-                    text: "On pace to hit \(bar.label) ~\(fmt.string(from: hit)), before it resets"))
+                    text: "On pace to hit \(bar.label) ~\(timeHM(hit)), before it resets"))
             }
         }
 
         let models = today.byModel
-        if today.cost >= 5, let top = models.first,
-           ["Opus", "Fable", "Mythos"].contains(top.0), top.2 / today.cost >= 0.8, models.count >= 1 {
-            let pct = Int((top.2 / today.cost * 100).rounded())
+        if todayCost >= 5, let top = models.first,
+           Pricing.rate(for: top.0).input >= 15, top.2 / todayCost >= 0.8 {
+            let pct = Int((top.2 / todayCost * 100).rounded())
             out.append(Insight(severity: .info,
                 text: "\(top.0) is \(pct)% of today's cost — Sonnet/Haiku for lighter tasks stretches limits"))
         }
@@ -801,9 +909,15 @@ func compactTokens(_ n: Int) -> String {
 
 func money(_ d: Double) -> String { String(format: "$%.2f", d) }
 
-func timeHM(_ d: Date) -> String {
-    let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
-}
+/// DateFormatter construction is expensive; cache the two formats we use.
+let hmFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+}()
+let weekdayHMFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "EEE HH:mm"; return f
+}()
+
+func timeHM(_ d: Date) -> String { hmFormatter.string(from: d) }
 
 // MARK: - Limit gauge views
 
@@ -823,9 +937,29 @@ func shortResetText(_ d: Date) -> String {
         let h = Int(interval) / 3600, m = (Int(interval) % 3600) / 60
         return h > 0 ? "in \(h)h \(m)m" : "in \(m)m"
     }
-    let f = DateFormatter()
-    f.dateFormat = "EEE HH:mm"
-    return f.string(from: d)
+    return weekdayHMFormatter.string(from: d)
+}
+
+/// Strokes a circular progress ring: full track plus an arc from 12 o'clock,
+/// clockwise, tinted by `limitColor`. Shared by the menu gauges and the
+/// status bar icon so the two can't drift apart.
+func strokeRing(center: NSPoint, radius: CGFloat, lineWidth: CGFloat, percent: Double) {
+    let track = NSBezierPath()
+    track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
+    track.lineWidth = lineWidth
+    NSColor.tertiaryLabelColor.withAlphaComponent(0.3).setStroke()
+    track.stroke()
+
+    let pct = min(max(percent, 0), 100)
+    if pct > 0 {
+        let arc = NSBezierPath()
+        arc.appendArc(withCenter: center, radius: radius,
+                      startAngle: 90, endAngle: 90 - 3.6 * pct, clockwise: true)
+        arc.lineWidth = lineWidth
+        arc.lineCapStyle = .round
+        limitColor(pct).setStroke()
+        arc.stroke()
+    }
 }
 
 /// A row of circular progress gauges, one per limit.
@@ -841,13 +975,6 @@ final class RingGaugesView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    private func displayName(_ bar: LimitBar) -> String {
-        if bar.label.hasPrefix("5-hour") { return "5-hour" }
-        if bar.label.hasSuffix("all models") { return "Weekly" }
-        if let dot = bar.label.range(of: " · ") { return String(bar.label[dot.upperBound...]) }
-        return bar.label
-    }
-
     override func draw(_ dirtyRect: NSRect) {
         let totalWidth = CGFloat(bars.count) * cellWidth
         var x = (bounds.width - totalWidth) / 2
@@ -858,47 +985,28 @@ final class RingGaugesView: NSView {
     }
 
     private func drawGauge(_ bar: LimitBar, in rect: NSRect) {
-        let center = NSPoint(x: rect.midX, y: rect.minY + 62)
-        let radius: CGFloat = 24
-        let lineWidth: CGFloat = 5.5
+        strokeRing(center: NSPoint(x: rect.midX, y: rect.minY + 62),
+                   radius: 24, lineWidth: 5.5, percent: bar.percent)
 
-        let track = NSBezierPath()
-        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
-        track.lineWidth = lineWidth
-        NSColor.tertiaryLabelColor.withAlphaComponent(0.25).setStroke()
-        track.stroke()
-
-        let pct = min(max(bar.percent, 0), 100)
-        if pct > 0 {
-            let arc = NSBezierPath()
-            // Start at 12 o'clock and sweep clockwise.
-            arc.appendArc(withCenter: center, radius: radius,
-                          startAngle: 90, endAngle: 90 - 3.6 * pct, clockwise: true)
-            arc.lineWidth = lineWidth
-            arc.lineCapStyle = .round
-            limitColor(pct).setStroke()
-            arc.stroke()
+        // Centered, truncating inside the cell so long model names can't
+        // spill into the neighboring gauge.
+        func drawCentered(_ s: String, y: CGFloat, font: NSFont, color: NSColor) {
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            para.lineBreakMode = .byTruncatingTail
+            (s as NSString).draw(
+                in: NSRect(x: rect.minX + 2, y: y, width: rect.width - 4, height: font.pointSize + 5),
+                withAttributes: [.font: font, .foregroundColor: color, .paragraphStyle: para])
         }
 
-        func drawCentered(_ s: String, y: CGFloat, attrs: [NSAttributedString.Key: Any]) {
-            let str = s as NSString
-            let w = str.size(withAttributes: attrs).width
-            str.draw(at: NSPoint(x: rect.midX - w / 2, y: y), withAttributes: attrs)
-        }
-
-        drawCentered(String(format: "%.0f%%", bar.percent), y: center.y - 7, attrs: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.labelColor,
-        ])
-        drawCentered(displayName(bar), y: rect.minY + 17, attrs: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
-        ])
+        drawCentered(String(format: "%.0f%%", bar.percent), y: rect.minY + 53,
+                     font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+                     color: .labelColor)
+        drawCentered(bar.displayName, y: rect.minY + 17,
+                     font: .systemFont(ofSize: 11, weight: .medium), color: .labelColor)
         if let resets = bar.resetsAt {
-            drawCentered(shortResetText(resets), y: rect.minY + 3, attrs: [
-                .font: NSFont.systemFont(ofSize: 9.5),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
+            drawCentered(shortResetText(resets), y: rect.minY + 3,
+                         font: .systemFont(ofSize: 9.5), color: .secondaryLabelColor)
         }
     }
 }
@@ -1073,13 +1181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !snap.insights.isEmpty {
             menu.addItem(header("Insights"))
             for insight in snap.insights {
-                let dotColor: NSColor
-                switch insight.severity {
-                case .info: dotColor = .systemBlue
-                case .warn: dotColor = .systemOrange
-                case .alert: dotColor = .systemRed
-                }
-                menu.addItem(coloredInfo([("● ", dotColor), (insight.text, .labelColor)], size: 12))
+                menu.addItem(coloredInfo([
+                    ("● ", Self.severityColor(insight.severity)),
+                    (insight.text, .labelColor),
+                ], size: 12))
             }
             menu.addItem(.separator())
         }
@@ -1087,8 +1192,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !snap.sessions.isEmpty {
             menu.addItem(header("Active sessions"))
             for s in snap.sessions {
-                let ctxColor: NSColor = s.contextTokens >= 160_000 ? .systemRed
-                    : s.contextTokens >= 120_000 ? .systemOrange : .secondaryLabelColor
+                let ctxColor = Insight.contextSeverity(s.contextTokens)
+                    .map(Self.severityColor) ?? .secondaryLabelColor
                 menu.addItem(coloredInfo([
                     ("   \(s.project)", .labelColor),
                     ("  \(s.model)", .secondaryLabelColor),
@@ -1176,6 +1281,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    private static func severityColor(_ s: Insight.Severity) -> NSColor {
+        switch s {
+        case .info: return .systemBlue
+        case .warn: return .systemOrange
+        case .alert: return .systemRed
+        }
+    }
+
     private static let modelDots: [String: NSColor] = [
         "Fable": .systemPurple, "Mythos": .systemPurple, "Opus": .systemIndigo,
         "Sonnet": .systemBlue, "Haiku": .systemTeal,
@@ -1216,28 +1329,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static func ringIcon(percent: Double) -> NSImage {
         let size: CGFloat = 15
-        let img = NSImage(size: NSSize(width: size, height: size))
-        img.lockFocus()
-        let center = NSPoint(x: size / 2, y: size / 2)
-        let radius: CGFloat = 5.5
-        let track = NSBezierPath()
-        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
-        track.lineWidth = 2.5
-        NSColor.tertiaryLabelColor.withAlphaComponent(0.4).setStroke()
-        track.stroke()
-        let pct = min(max(percent, 0), 100)
-        if pct > 0 {
-            let arc = NSBezierPath()
-            arc.appendArc(withCenter: center, radius: radius,
-                          startAngle: 90, endAngle: 90 - 3.6 * pct, clockwise: true)
-            arc.lineWidth = 2.5
-            arc.lineCapStyle = .round
-            limitColor(pct).setStroke()
-            arc.stroke()
+        // A drawing-handler image re-renders per destination appearance, so the
+        // dynamic colors resolve against the menu bar's light/dark mode instead
+        // of being baked in at refresh time.
+        return NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
+            strokeRing(center: NSPoint(x: size / 2, y: size / 2),
+                       radius: 5.5, lineWidth: 2.5, percent: percent)
+            return true
         }
-        img.unlockFocus()
-        img.isTemplate = false
-        return img
     }
 
     private func header(_ s: String) -> NSMenuItem {
