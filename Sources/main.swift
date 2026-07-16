@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ServiceManagement
 
 // MARK: - Data model
 
@@ -10,13 +11,13 @@ struct UsageEntry {
     let outputTokens: Int
     let cacheCreationTokens: Int
     let cacheReadTokens: Int
+    /// message id + request id; empty when neither is present
+    let dedupeKey: String
 
     var totalTokens: Int { inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens }
 }
 
-struct BlockStats {
-    var start: Date
-    var end: Date { start.addingTimeInterval(5 * 3600) }
+struct Stats {
     var entries: [UsageEntry] = []
 
     var inputTokens: Int { entries.reduce(0) { $0 + $1.inputTokens } }
@@ -24,11 +25,27 @@ struct BlockStats {
     var cacheCreationTokens: Int { entries.reduce(0) { $0 + $1.cacheCreationTokens } }
     var cacheReadTokens: Int { entries.reduce(0) { $0 + $1.cacheReadTokens } }
     var totalTokens: Int { entries.reduce(0) { $0 + $1.totalTokens } }
-
     var cost: Double { entries.reduce(0) { $0 + Pricing.cost(for: $1) } }
+
+    /// (model short name, tokens, cost) sorted by cost descending
+    var byModel: [(String, Int, Double)] {
+        var agg: [String: (Int, Double)] = [:]
+        for e in entries {
+            let name = Pricing.shortName(e.model)
+            let cur = agg[name] ?? (0, 0)
+            agg[name] = (cur.0 + e.totalTokens, cur.1 + Pricing.cost(for: e))
+        }
+        return agg.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.2 > $1.2 }
+    }
 }
 
-// MARK: - Pricing (USD per million tokens)
+struct BlockStats {
+    var start: Date
+    var end: Date { start.addingTimeInterval(5 * 3600) }
+    var stats = Stats()
+}
+
+// MARK: - Pricing (USD per million tokens, list API pricing)
 
 enum Pricing {
     struct Rate { let input: Double; let output: Double; let cacheWrite: Double; let cacheRead: Double }
@@ -45,6 +62,14 @@ enum Pricing {
         return Rate(input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3)
     }
 
+    static func shortName(_ model: String) -> String {
+        let m = model.lowercased()
+        for name in ["fable", "mythos", "opus", "sonnet", "haiku"] where m.contains(name) {
+            return name.capitalized
+        }
+        return model.isEmpty ? "unknown" : model
+    }
+
     static func cost(for e: UsageEntry) -> Double {
         let r = rate(for: e.model)
         return (Double(e.inputTokens) * r.input
@@ -54,11 +79,18 @@ enum Pricing {
     }
 }
 
-// MARK: - JSONL parsing
+// MARK: - JSONL parsing with per-file cache
 
 final class UsageReader {
     private let projectsDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/projects")
+
+    private struct CachedFile {
+        let mtime: Date
+        let size: Int
+        let entries: [UsageEntry]
+    }
+    private var cache: [String: CachedFile] = [:]
 
     private let isoParser: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -71,82 +103,132 @@ final class UsageReader {
         isoParser.date(from: s) ?? isoParserNoFrac.date(from: s)
     }
 
-    /// Read usage entries from files modified after `cutoff`, deduped by message id + request id.
+    /// All usage entries in files modified after `cutoff`, deduped by message id +
+    /// request id, sorted by timestamp. Unchanged files are served from cache.
     func entries(since cutoff: Date) -> [UsageEntry] {
         var result: [UsageEntry] = []
         var seen = Set<String>()
+        var liveFiles = Set<String>()
 
-        guard let en = FileManager.default.enumerator(at: projectsDir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
+        guard let en = FileManager.default.enumerator(
+            at: projectsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { return [] }
+
         for case let url as URL in en {
             guard url.pathExtension == "jsonl" else { continue }
-            if let mod = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-               mod < cutoff { continue }
-            guard let data = FileManager.default.contents(atPath: url.path),
-                  let text = String(data: data, encoding: .utf8) else { continue }
+            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                  let mtime = vals.contentModificationDate else { continue }
+            if mtime < cutoff { continue }
+            let size = vals.fileSize ?? 0
+            let path = url.path
+            liveFiles.insert(path)
 
-            for line in text.split(separator: "\n") {
-                // cheap pre-filter before JSON parsing
-                guard line.contains("\"usage\"") else { continue }
-                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                      let tsStr = obj["timestamp"] as? String,
-                      let ts = parseDate(tsStr), ts >= cutoff,
-                      let message = obj["message"] as? [String: Any],
-                      let usage = message["usage"] as? [String: Any] else { continue }
+            let fileEntries: [UsageEntry]
+            if let c = cache[path], c.mtime == mtime, c.size == size {
+                fileEntries = c.entries
+            } else {
+                fileEntries = parseFile(url)
+                cache[path] = CachedFile(mtime: mtime, size: size, entries: fileEntries)
+            }
 
-                let msgId = (message["id"] as? String) ?? ""
-                let reqId = (obj["requestId"] as? String) ?? ""
-                if !msgId.isEmpty || !reqId.isEmpty {
-                    let key = msgId + ":" + reqId
-                    if seen.contains(key) { continue }
-                    seen.insert(key)
-                }
-
-                result.append(UsageEntry(
-                    timestamp: ts,
-                    model: (message["model"] as? String) ?? "",
-                    inputTokens: usage["input_tokens"] as? Int ?? 0,
-                    outputTokens: usage["output_tokens"] as? Int ?? 0,
-                    cacheCreationTokens: usage["cache_creation_input_tokens"] as? Int ?? 0,
-                    cacheReadTokens: usage["cache_read_input_tokens"] as? Int ?? 0
-                ))
+            for e in fileEntries where e.timestamp >= cutoff {
+                result.append(e)
             }
         }
-        return result.sorted { $0.timestamp < $1.timestamp }
+
+        // Drop cache entries for files that fell outside the window or were deleted.
+        for key in cache.keys where !liveFiles.contains(key) {
+            cache.removeValue(forKey: key)
+        }
+
+        // Dedupe across files (same message can appear in resumed/forked sessions).
+        var deduped: [UsageEntry] = []
+        deduped.reserveCapacity(result.count)
+        for e in result.sorted(by: { $0.timestamp < $1.timestamp }) {
+            if e.dedupeKey.isEmpty || seen.insert(e.dedupeKey).inserted {
+                deduped.append(e)
+            }
+        }
+        return deduped
     }
 
+    private func parseFile(_ url: URL) -> [UsageEntry] {
+        guard let data = FileManager.default.contents(atPath: url.path),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        var out: [UsageEntry] = []
+        for line in text.split(separator: "\n") {
+            guard line.contains("\"usage\"") else { continue }
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let tsStr = obj["timestamp"] as? String,
+                  let ts = parseDate(tsStr),
+                  let message = obj["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any] else { continue }
+
+            let model = (message["model"] as? String) ?? ""
+            if model == "<synthetic>" { continue }
+
+            out.append(UsageEntry(
+                timestamp: ts,
+                model: model,
+                inputTokens: usage["input_tokens"] as? Int ?? 0,
+                outputTokens: usage["output_tokens"] as? Int ?? 0,
+                cacheCreationTokens: usage["cache_creation_input_tokens"] as? Int ?? 0,
+                cacheReadTokens: usage["cache_read_input_tokens"] as? Int ?? 0,
+                dedupeKey: {
+                    let msgId = (message["id"] as? String) ?? ""
+                    let reqId = (obj["requestId"] as? String) ?? ""
+                    return (msgId.isEmpty && reqId.isEmpty) ? "" : msgId + ":" + reqId
+                }()
+            ))
+        }
+        return out
+    }
+}
+
+// MARK: - Usage snapshot
+
+struct Snapshot {
+    var block: BlockStats?
+    var today: Stats
+    var week: Stats
+}
+
+enum UsageMath {
     /// Active 5-hour billing block (ccusage algorithm: block start = first entry's
     /// timestamp floored to the hour; a block ends 5h after start or after a 5h gap).
-    func activeBlock(now: Date = Date()) -> BlockStats? {
-        // Entries from the last 10h are enough to determine the current block.
-        let all = entries(since: now.addingTimeInterval(-10 * 3600))
-        guard !all.isEmpty else { return nil }
-
+    static func activeBlock(entries: [UsageEntry], now: Date) -> BlockStats? {
         var block: BlockStats? = nil
-        for e in all {
+        for e in entries {
             if var b = block {
-                if e.timestamp >= b.end || (b.entries.last.map { e.timestamp.timeIntervalSince($0.timestamp) > 5 * 3600 } ?? false) {
-                    block = BlockStats(start: floorToHour(e.timestamp), entries: [e])
+                let gap = b.stats.entries.last.map { e.timestamp.timeIntervalSince($0.timestamp) > 5 * 3600 } ?? false
+                if e.timestamp >= b.end || gap {
+                    block = BlockStats(start: floorToHour(e.timestamp), stats: Stats(entries: [e]))
                 } else {
-                    b.entries.append(e)
+                    b.stats.entries.append(e)
                     block = b
                 }
             } else {
-                block = BlockStats(start: floorToHour(e.timestamp), entries: [e])
+                block = BlockStats(start: floorToHour(e.timestamp), stats: Stats(entries: [e]))
             }
         }
         guard let b = block, now < b.end,
-              let last = b.entries.last, now.timeIntervalSince(last.timestamp) < 5 * 3600 else { return nil }
+              let last = b.stats.entries.last,
+              now.timeIntervalSince(last.timestamp) < 5 * 3600 else { return nil }
         return b
     }
 
-    func todayStats(now: Date = Date()) -> BlockStats {
-        let startOfDay = Calendar.current.startOfDay(for: now)
-        var b = BlockStats(start: startOfDay)
-        b.entries = entries(since: startOfDay)
-        return b
+    static func snapshot(reader: UsageReader, now: Date) -> Snapshot {
+        let weekStart = now.addingTimeInterval(-7 * 24 * 3600)
+        let all = reader.entries(since: weekStart)
+        let dayStart = Calendar.current.startOfDay(for: now)
+        return Snapshot(
+            block: activeBlock(entries: all.filter { $0.timestamp >= now.addingTimeInterval(-10 * 3600) }, now: now),
+            today: Stats(entries: all.filter { $0.timestamp >= dayStart }),
+            week: Stats(entries: all)
+        )
     }
 
-    private func floorToHour(_ d: Date) -> Date {
+    static func floorToHour(_ d: Date) -> Date {
         Date(timeIntervalSince1970: (d.timeIntervalSince1970 / 3600).rounded(.down) * 3600)
     }
 }
@@ -174,6 +256,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let reader = UsageReader()
     private var timer: Timer?
 
+    private enum TitleMode: String, CaseIterable {
+        case both, tokens, cost
+        var label: String {
+            switch self {
+            case .both: return "Tokens + cost"
+            case .tokens: return "Tokens only"
+            case .cost: return "Cost only"
+            }
+        }
+    }
+    private var titleMode: TitleMode {
+        get { TitleMode(rawValue: UserDefaults.standard.string(forKey: "titleMode") ?? "") ?? .both }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "titleMode") }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "CC …"
@@ -185,33 +282,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func refreshClicked() { refresh() }
     @objc private func quit() { NSApp.terminate(nil) }
 
+    @objc private func setTitleMode(_ sender: NSMenuItem) {
+        if let mode = TitleMode(rawValue: sender.representedObject as? String ?? "") {
+            titleMode = mode
+            refresh()
+        }
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            NSLog("launch-at-login toggle failed: \(error)")
+        }
+        refresh()
+    }
+
     private func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let now = Date()
-            let block = self.reader.activeBlock(now: now)
-            let today = self.reader.todayStats(now: now)
-            DispatchQueue.main.async { self.render(block: block, today: today, now: now) }
+            let snap = UsageMath.snapshot(reader: self.reader, now: now)
+            DispatchQueue.main.async { self.render(snap, now: now) }
         }
     }
 
-    private func render(block: BlockStats?, today: BlockStats, now: Date) {
+    private func render(_ snap: Snapshot, now: Date) {
         let menu = NSMenu()
 
-        if let b = block {
-            statusItem.button?.title = "CC \(compactTokens(b.totalTokens)) · \(money(b.cost))"
+        if let b = snap.block {
+            let s = b.stats
+            switch titleMode {
+            case .both: statusItem.button?.title = "CC \(compactTokens(s.totalTokens)) · \(money(s.cost))"
+            case .tokens: statusItem.button?.title = "CC \(compactTokens(s.totalTokens))"
+            case .cost: statusItem.button?.title = "CC \(money(s.cost))"
+            }
 
             menu.addItem(header("Current 5h block  (\(timeHM(b.start))–\(timeHM(b.end)))"))
-            menu.addItem(info("Tokens: \(compactTokens(b.totalTokens))   Cost: \(money(b.cost))"))
-            menu.addItem(info("In \(compactTokens(b.inputTokens)) · Out \(compactTokens(b.outputTokens)) · CacheW \(compactTokens(b.cacheCreationTokens)) · CacheR \(compactTokens(b.cacheReadTokens))"))
+            menu.addItem(info("Tokens: \(compactTokens(s.totalTokens))   Cost: \(money(s.cost))"))
+            menu.addItem(info("In \(compactTokens(s.inputTokens)) · Out \(compactTokens(s.outputTokens)) · CacheW \(compactTokens(s.cacheCreationTokens)) · CacheR \(compactTokens(s.cacheReadTokens))"))
 
             let elapsed = now.timeIntervalSince(b.start)
             let remaining = max(0, b.end.timeIntervalSince(now))
             if elapsed > 60 {
-                let perMin = Double(b.totalTokens) / (elapsed / 60)
+                let perMin = Double(s.totalTokens) / (elapsed / 60)
                 menu.addItem(info(String(format: "Burn rate: %@/min   Resets in %dh %02dm",
                                          compactTokens(Int(perMin)), Int(remaining) / 3600, (Int(remaining) % 3600) / 60)))
             }
+            addModelBreakdown(s, to: menu)
         } else {
             statusItem.button?.title = "CC idle"
             menu.addItem(header("No active 5h block"))
@@ -219,7 +341,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         menu.addItem(header("Today"))
-        menu.addItem(info("Tokens: \(compactTokens(today.totalTokens))   Cost: \(money(today.cost))"))
+        menu.addItem(info("Tokens: \(compactTokens(snap.today.totalTokens))   Cost: \(money(snap.today.cost))"))
+        addModelBreakdown(snap.today, to: menu)
+
+        menu.addItem(.separator())
+        menu.addItem(header("Last 7 days"))
+        menu.addItem(info("Tokens: \(compactTokens(snap.week.totalTokens))   Cost: \(money(snap.week.cost))"))
+
+        menu.addItem(.separator())
+        let display = NSMenuItem(title: "Menu bar shows", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for mode in TitleMode.allCases {
+            let i = NSMenuItem(title: mode.label, action: #selector(setTitleMode(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = mode.rawValue
+            i.state = (mode == titleMode) ? .on : .off
+            sub.addItem(i)
+        }
+        display.submenu = sub
+        menu.addItem(display)
+
+        let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        login.target = self
+        login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        menu.addItem(login)
 
         menu.addItem(.separator())
         menu.addItem(info("Cost is estimated from list API pricing"))
@@ -229,6 +374,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(q)
 
         statusItem.menu = menu
+    }
+
+    private func addModelBreakdown(_ s: Stats, to menu: NSMenu) {
+        let models = s.byModel
+        guard models.count > 1 || (models.first.map { $0.0 != "unknown" } ?? false) else { return }
+        for (name, tokens, cost) in models {
+            menu.addItem(info("   \(name): \(compactTokens(tokens)) · \(money(cost))"))
+        }
     }
 
     private func header(_ s: String) -> NSMenuItem {
