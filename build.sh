@@ -18,7 +18,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleIdentifier</key><string>com.mathiasbesil.halo</string>
     <key>CFBundleName</key><string>Halo for Claude</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.01</string>
+    <key>CFBundleShortVersionString</key><string>0.02</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
