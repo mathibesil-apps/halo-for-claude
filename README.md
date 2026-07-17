@@ -23,17 +23,25 @@ ones appear in the app.</sub>
 
 ## Install
 
+### Download (easiest)
+
+**[⬇ Download the latest .dmg](https://github.com/mathibesil-apps/halo-for-claude/releases/latest)**,
+open it, and drag **Halo for Claude** into Applications. It's signed and
+notarized by Apple, so it opens with a double-click — no security warnings.
+
+Then, in the menu: **Launch at login**.
+
+### Build from source
+
 Requires macOS and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/<you>/halo-for-claude.git
+git clone https://github.com/mathibesil-apps/halo-for-claude.git
 cd halo-for-claude
 ./build.sh
 cp -r "Halo for Claude.app" /Applications
 open "/Applications/Halo for Claude.app"
 ```
-
-Then, in the menu: **Launch at login**.
 
 ## Sign-in (usually none)
 
@@ -97,6 +105,23 @@ New to the numbers? The menu has a **"What do these numbers mean?"** explainer.
 - **Demo mode** (for docs screenshots) anonymizes project names:
   `defaults write com.mathiasbesil.halo demoMode -bool true`, relaunch, capture,
   then `-bool false` and relaunch to restore your real names.
+
+## Releasing (maintainer)
+
+`./release.sh` builds, signs with a Developer ID + hardened runtime, packages a
+drag-to-Applications `.dmg`, notarizes it with Apple, and staples the ticket.
+
+One-time setup: create an app-specific password at
+[appleid.apple.com](https://appleid.apple.com), then store notary credentials
+once:
+
+```bash
+xcrun notarytool store-credentials "halo-notary" \
+    --apple-id "you@example.com" --team-id "YOURTEAMID"
+```
+
+Then `./release.sh` produces `Halo-for-Claude.dmg`, which is uploaded as a
+GitHub Release asset (the `.dmg` itself is git-ignored).
 
 ## License
 
