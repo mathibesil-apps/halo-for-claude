@@ -1,4 +1,4 @@
-# Halo
+# Halo for Claude
 
 Claude Code usage in your macOS menu bar — how much of each plan limit you've
 burned, at a glance, with a nudge before you hit one.
@@ -19,11 +19,11 @@ Click it for reset times, what's driving your spend, and what to do about it.
 Requires macOS and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/<you>/halo.git
-cd halo
+git clone https://github.com/<you>/halo-for-claude.git
+cd halo-for-claude
 ./build.sh
-cp -r Halo.app /Applications
-open /Applications/Halo.app
+cp -r "Halo for Claude.app" /Applications
+open "/Applications/Halo for Claude.app"
 ```
 
 Then, in the menu: **Launch at login**.

@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build Halo.app — Claude Code usage in your menu bar.
+# Build "Halo for Claude.app" — Claude Code usage in your menu bar.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Halo.app"
+APP="Halo for Claude.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
@@ -16,7 +16,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <dict>
     <key>CFBundleExecutable</key><string>Halo</string>
     <key>CFBundleIdentifier</key><string>com.mathiasbesil.halo</string>
-    <key>CFBundleName</key><string>Halo</string>
+    <key>CFBundleName</key><string>Halo for Claude</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.01</string>
     <key>LSUIElement</key><true/>

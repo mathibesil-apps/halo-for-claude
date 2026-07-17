@@ -1,3 +1,2 @@
-Halo.app/
-Claude Usage.app/
+*.app/
 .DS_Store
