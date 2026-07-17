@@ -4,6 +4,34 @@ import Foundation
 import ServiceManagement
 import UserNotifications
 
+// MARK: - Demo mode
+
+/// Anonymizes real project names for documentation screenshots, so a public
+/// screenshot never leaks what you're actually working on. Turn on with:
+///     defaults write com.mathiasbesil.halo demoMode -bool true
+/// and off again with `-bool false` (then relaunch). Only the display name
+/// changes; every real name still maps to a single stable generic one, so
+/// per-project totals stay consistent.
+enum Demo {
+    static let on = UserDefaults.standard.bool(forKey: "demoMode")
+
+    private static let names = [
+        "web-app", "api-server", "mobile-client", "data-pipeline",
+        "auth-service", "dashboard", "payments-svc", "notebooks",
+        "cli-tools", "landing-page", "worker-queue", "docs-site",
+        "search-index", "billing", "analytics", "gateway",
+    ]
+
+    /// Stable across runs (djb2, not Swift's per-process-seeded hash), so the
+    /// same project keeps the same generic name between launches.
+    static func project(_ real: String) -> String {
+        guard on else { return real }
+        var hash: UInt64 = 5381
+        for byte in real.utf8 { hash = (hash &* 33) &+ UInt64(byte) }
+        return names[Int(hash % UInt64(names.count))]
+    }
+}
+
 // MARK: - Data model
 
 struct UsageEntry {
@@ -26,7 +54,7 @@ struct UsageEntry {
     var contextTokens: Int { inputTokens + cacheCreationTokens + cacheReadTokens }
     var project: String {
         let name = (cwd as NSString).lastPathComponent
-        return name.isEmpty ? "unknown" : name
+        return Demo.project(name.isEmpty ? "unknown" : name)
     }
 }
 
