@@ -4,10 +4,15 @@ A macOS menu bar app showing your current Claude Code usage: plan limit
 percentages from your Claude account (optional sign-in), plus token/cost stats
 computed locally from the transcript logs in `~/.claude/projects`.
 
-**Menu bar:** a colored progress ring (worst limit) plus each limit's
-percentage — `◔ 5h 42%  W 13%  F 27%` — tinted orange at 70% and red at 90%.
-Without sign-in it falls back to `CC 1.3M · $10.30` for the current 5-hour
-block (`CC idle` when there is no active block).
+**Menu bar:** one progress ring per limit with its percentage —
+`◔ 5h 42%  ◔ Wk 13%  ◔ F 27%` — tinted orange at 70% and red at 90%, or
+"Worst limit only" for a compact single ring. Without sign-in it falls back to
+`CC 1.3M · $10.30` for the current 5-hour block (`CC idle` when there is no
+active block).
+
+**Notifications** (on by default, toggleable): fires once per limit window
+when a limit crosses 80% and again at 95%, when your current pace would
+exhaust a limit before it resets, and when a nearly-spent limit resets.
 
 **Dropdown menu:**
 - Plan usage limits as circular gauges (5-hour, weekly, per-model) with reset
@@ -24,8 +29,10 @@ block (`CC idle` when there is no active block).
   estimated cost, burn rate, time until the block resets, per-model breakdown
 - Today's totals, hourly spend mini-chart, per-model breakdown
 - Last 7 days totals
-- "Menu bar shows" — choose tokens, cost, or both in the fallback title
-- Launch at login toggle, sign in/out, Refresh / Quit
+- "Menu bar shows" — all limits or worst-only; tokens/cost/both for the
+  fallback title
+- "What do these numbers mean?" — built-in explainer for every section
+- Notifications toggle, launch at login toggle, sign in/out, Refresh / Quit
 
 Data refreshes automatically every 60 seconds. Files are parsed once and
 cached by (mtime, size), so the first refresh scans a week of logs and later

@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import Foundation
 import ServiceManagement
+import UserNotifications
 
 // MARK: - Data model
 
@@ -288,6 +289,80 @@ final class LimitTracker {
         let hit = now.addingTimeInterval(minutes * 60)
         if let resets = bar.resetsAt, resets <= hit { return nil }
         return hit
+    }
+}
+
+/// Posts macOS notifications when a limit crosses 80% / 95%, when the current
+/// pace would exhaust it before its reset, and when a nearly-exhausted limit
+/// resets. Each event fires at most once per limit window.
+final class LimitNotifier {
+    static let shared = LimitNotifier()
+    private var lastPercent: [String: Double] = [:]
+    /// Highest threshold already announced for the current window, per limit.
+    private var announced: [String: Double] = [:]
+    private var projectionAnnounced: Set<String> = []
+
+    var enabled: Bool {
+        get { UserDefaults.standard.object(forKey: "notifyNearLimits") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "notifyNearLimits") }
+    }
+
+    func requestAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            if !granted { NSLog("notifications not authorized") }
+        }
+    }
+
+    /// Call with fresh (non-stale) bars only; stale bars repeat old percentages.
+    func check(_ bars: [LimitBar], now: Date) {
+        guard enabled else { return }
+        for bar in bars {
+            let key = bar.trackerKey
+            defer { lastPercent[key] = bar.percent }
+
+            // A meaningful drop means the window reset: clear this limit's
+            // announcements and, if it had nearly run out, say it's back.
+            if let prev = lastPercent[key], bar.percent < prev - 5 {
+                let hadWarned = (announced[key] ?? 0) >= 80
+                announced[key] = nil
+                projectionAnnounced.remove(key)
+                if hadWarned {
+                    post(title: "\(bar.label) has reset",
+                         body: "Back to \(Int(bar.percent))% — you're good to go.",
+                         id: "reset-\(key)")
+                }
+            }
+
+            for threshold in [95.0, 80.0] where bar.percent >= threshold {
+                if (announced[key] ?? 0) < threshold {
+                    announced[key] = threshold
+                    let resets = bar.resetsAt.map { " Resets \(shortResetText($0))." } ?? ""
+                    post(title: "\(bar.label): \(Int(bar.percent))% used",
+                         body: threshold >= 95
+                             ? "Almost exhausted.\(resets)"
+                             : "Getting close — lighter models stretch it.\(resets)",
+                         id: "limit-\(key)")
+                }
+                break
+            }
+
+            if !projectionAnnounced.contains(key), bar.percent < 80,
+               let hit = LimitTracker.shared.projectedHit(bar, now: now) {
+                projectionAnnounced.insert(key)
+                post(title: "On pace to hit \(bar.label)",
+                     body: "At the current pace it runs out around \(timeHM(hit)), before it resets.",
+                     id: "proj-\(key)")
+            }
+        }
+    }
+
+    private func post(title: String, body: String, id: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: id, content: content, trigger: nil))
     }
 }
 
@@ -601,7 +676,7 @@ final class ClaudeAccount {
             let short: String
             switch kind {
             case "session": label = "5-hour limit"; short = "5h"
-            case "weekly_all": label = "Weekly · all models"; short = "W"
+            case "weekly_all": label = "Weekly · all models"; short = "Wk"
             case "weekly_scoped":
                 let name = scopeName ?? "scoped"
                 label = "Weekly · \(name)"
@@ -629,7 +704,7 @@ final class ClaudeAccount {
         }
         let labels: [(String, String, String)] = [
             ("five_hour", "5-hour limit", "5h"),
-            ("seven_day", "Weekly · all models", "W"),
+            ("seven_day", "Weekly · all models", "Wk"),
             ("seven_day_sonnet", "Weekly · Sonnet", "S"),
             ("seven_day_opus", "Weekly · Opus", "O"),
             ("seven_day_fable", "Weekly · Fable", "F"),
@@ -1055,7 +1130,7 @@ final class HourBarsView: NSView {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private let reader = UsageReader()
     private var timer: Timer?
@@ -1077,12 +1152,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "titleMode") }
     }
 
+    /// How the plan limits appear in the menu bar itself.
+    private enum LimitStyle: String, CaseIterable {
+        case all, worst
+        var label: String {
+            switch self {
+            case .all: return "All limits"
+            case .worst: return "Worst limit only"
+            }
+        }
+    }
+    private var limitStyle: LimitStyle {
+        get { LimitStyle(rawValue: UserDefaults.standard.string(forKey: "limitStyle") ?? "") ?? .all }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "limitStyle") }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "CC …"
         statusItem.menu = NSMenu()
+        UNUserNotificationCenter.current().delegate = self
+        if LimitNotifier.shared.enabled { LimitNotifier.shared.requestAuthorization() }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    /// Show banners even though a menu bar app technically counts as frontmost.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler:
+                                    @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
     }
 
     @objc private func refreshClicked() { refresh(forceLimits: true) }
@@ -1093,6 +1193,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             titleMode = mode
             refresh()
         }
+    }
+
+    @objc private func setLimitStyle(_ sender: NSMenuItem) {
+        if let style = LimitStyle(rawValue: sender.representedObject as? String ?? "") {
+            limitStyle = style
+            refresh()
+        }
+    }
+
+    @objc private func toggleNotifications() {
+        LimitNotifier.shared.enabled.toggle()
+        if LimitNotifier.shared.enabled { LimitNotifier.shared.requestAuthorization() }
+        refresh()
+    }
+
+    @objc private func explain() {
+        let alert = NSAlert()
+        alert.messageText = "What am I looking at?"
+        alert.informativeText = """
+        RINGS — how much of each Claude plan rate limit you've used, straight from \
+        your account (the same numbers as claude.ai's usage page). "5-hour" is the \
+        rolling session limit, "Weekly" covers all models, and a model-named ring \
+        (e.g. Fable) is that model's own weekly limit. Each ring fills clockwise and \
+        turns orange at 70% and red at 90%; the time under it is when it resets. \
+        100% means Claude stops answering until the reset.
+
+        CURRENT 5-HOUR SESSION — tokens and estimated cost of your ongoing Claude \
+        Code activity, read from the local logs in ~/.claude. "Burn rate" is tokens \
+        per minute in this window.
+
+        INSIGHTS — automatic tips: usage spikes, sessions whose context has grown \
+        huge (run /clear or /compact there), being on pace to hit a limit before it \
+        resets, and expensive-model-heavy days.
+
+        TODAY / LAST 7 DAYS — local totals. Cost is what this usage would cost at \
+        list API prices — on a Pro/Max subscription you don't actually pay it; it's \
+        a sense of scale, and of what each limit window "buys" you.
+        """
+        alert.addButton(withTitle: "Got it")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func signIn() {
@@ -1162,10 +1303,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if bars.isEmpty { statusItem.button?.image = nil }
         if let limits = snap.limits, !bars.isEmpty {
             setStatusTitle(bars)
+            if !limits.stale { LimitNotifier.shared.check(bars, now: now) }
 
             menu.addItem(header(limits.stale
                 ? "Plan usage limits  (as of \(timeHM(limits.fetchedAt)))"
                 : "Plan usage limits"))
+            menu.addItem(coloredInfo([
+                ("How much of each plan limit you've used — resets at the time shown",
+                 .secondaryLabelColor),
+            ], size: 11))
             let rings = NSMenuItem()
             rings.view = RingGaugesView(bars)
             menu.addItem(rings)
@@ -1214,9 +1360,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            menu.addItem(header("Current 5h block  (\(timeHM(b.start))–\(timeHM(b.end)))"))
+            menu.addItem(header("Current 5-hour session  (\(timeHM(b.start))–\(timeHM(b.end)))"))
             menu.addItem(info("Tokens: \(compactTokens(s.totalTokens))   Cost: \(money(s.cost))"))
-            menu.addItem(info("In \(compactTokens(s.inputTokens)) · Out \(compactTokens(s.outputTokens)) · CacheW \(compactTokens(s.cacheCreationTokens)) · CacheR \(compactTokens(s.cacheReadTokens))"))
+            let io = info("In \(compactTokens(s.inputTokens)) · Out \(compactTokens(s.outputTokens)) · CacheW \(compactTokens(s.cacheCreationTokens)) · CacheR \(compactTokens(s.cacheReadTokens))")
+            io.toolTip = "Input / output tokens, plus prompt-cache writes and reads (cache reads are ~10× cheaper than input)"
+            menu.addItem(io)
 
             let elapsed = now.timeIntervalSince(b.start)
             let remaining = max(0, b.end.timeIntervalSince(now))
@@ -1250,6 +1398,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let display = NSMenuItem(title: "Menu bar shows", action: nil, keyEquivalent: "")
         let sub = NSMenu()
+        for style in LimitStyle.allCases {
+            let i = NSMenuItem(title: style.label, action: #selector(setLimitStyle(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = style.rawValue
+            i.state = (style == limitStyle) ? .on : .off
+            sub.addItem(i)
+        }
+        sub.addItem(.separator())
+        // No action → auto-disabled, acts as a section label.
+        sub.addItem(NSMenuItem(title: "When limits are unavailable:", action: nil, keyEquivalent: ""))
         for mode in TitleMode.allCases {
             let i = NSMenuItem(title: mode.label, action: #selector(setTitleMode(_:)), keyEquivalent: "")
             i.target = self
@@ -1259,6 +1417,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         display.submenu = sub
         menu.addItem(display)
+
+        let notify = NSMenuItem(title: "Notify when limits run low",
+                                action: #selector(toggleNotifications), keyEquivalent: "")
+        notify.target = self
+        notify.state = LimitNotifier.shared.enabled ? .on : .off
+        notify.toolTip = "Notifies at 80% and 95% of any limit, when you're on pace to hit one, and when a nearly-spent limit resets"
+        menu.addItem(notify)
 
         let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         login.target = self
@@ -1272,7 +1437,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(info("Cost is estimated from list API pricing"))
+        let help = NSMenuItem(title: "What do these numbers mean?", action: #selector(explain), keyEquivalent: "")
+        help.target = self
+        menu.addItem(help)
         let r = NSMenuItem(title: "Refresh", action: #selector(refreshClicked), keyEquivalent: "r"); r.target = self
         menu.addItem(r)
         let q = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"); q.target = self
@@ -1314,9 +1481,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // standalone button image is unused.
         statusItem.button?.image = nil
 
+        let shown: [LimitBar]
+        switch limitStyle {
+        case .all: shown = bars
+        case .worst: shown = bars.max { $0.percent < $1.percent }.map { [$0] } ?? []
+        }
+
         let title = NSMutableAttributedString()
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        for (i, bar) in bars.enumerated() {
+        for (i, bar) in shown.enumerated() {
             if i > 0 { title.append(NSAttributedString(string: "  ")) }
 
             let attachment = NSTextAttachment()
