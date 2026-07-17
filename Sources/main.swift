@@ -292,16 +292,52 @@ final class LimitTracker {
     }
 }
 
-/// Posts macOS notifications when a limit crosses 80% / 95%, when the current
-/// pace would exhaust it before its reset, and when a nearly-exhausted limit
-/// resets. Each event fires at most once per limit window.
+/// The kinds of notification the app can post. Each is independently
+/// switchable, so anything that turns out to be noise can be turned off on its
+/// own without silencing the rest.
+enum NotifyKind: String, CaseIterable {
+    case nearLimit, projected, headroom, reset
+
+    var label: String {
+        switch self {
+        case .nearLimit: return "Approaching a limit (80%, 95%)"
+        case .projected: return "On pace to hit a limit"
+        case .headroom: return "Unused capacity before a reset"
+        case .reset: return "A spent limit has reset"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .nearLimit: return "Once when a limit passes 80% and again at 95%"
+        case .projected: return "When your current pace would exhaust a limit before it resets"
+        case .headroom: return "Shortly before a window resets while a good chunk of it is still unused — spend it or lose it"
+        case .reset: return "When a limit you nearly used up rolls over"
+        }
+    }
+
+    var enabled: Bool {
+        get { UserDefaults.standard.object(forKey: "notify.\(rawValue)") as? Bool ?? true }
+        nonmutating set { UserDefaults.standard.set(newValue, forKey: "notify.\(rawValue)") }
+    }
+}
+
+/// Posts macOS notifications about limit windows. Every event fires at most
+/// once per limit per window; the record of what already fired is keyed by the
+/// window's reset time, so it survives restarts without re-notifying.
 final class LimitNotifier {
     static let shared = LimitNotifier()
-    private var lastPercent: [String: Double] = [:]
-    /// Highest threshold already announced for the current window, per limit.
-    private var announced: [String: Double] = [:]
-    private var projectionAnnounced: Set<String> = []
+    /// Highest percent seen in the current window, per limit — a big drop means
+    /// the window rolled over.
+    private var peak: [String: Double] = [:]
+    /// Event id -> when it stops mattering (unix time); pruned as windows pass.
+    private var fired: [String: Double]
 
+    private init() {
+        fired = (UserDefaults.standard.dictionary(forKey: "notifyFired") as? [String: Double]) ?? [:]
+    }
+
+    /// Master switch; the per-kind toggles live on `NotifyKind`.
     var enabled: Bool {
         get { UserDefaults.standard.object(forKey: "notifyNearLimits") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "notifyNearLimits") }
@@ -313,50 +349,75 @@ final class LimitNotifier {
         }
     }
 
+    /// How early to flag unused capacity: the 5-hour window is short enough that
+    /// half an hour is still usable; a weekly window deserves more warning.
+    private func headroomLead(_ bar: LimitBar) -> TimeInterval {
+        (bar.kind == "session" || bar.kind == "five_hour") ? 30 * 60 : 60 * 60
+    }
+
     /// Call with fresh (non-stale) bars only; stale bars repeat old percentages.
     func check(_ bars: [LimitBar], now: Date) {
         guard enabled else { return }
         for bar in bars {
             let key = bar.trackerKey
-            defer { lastPercent[key] = bar.percent }
 
-            // A meaningful drop means the window reset: clear this limit's
-            // announcements and, if it had nearly run out, say it's back.
-            if let prev = lastPercent[key], bar.percent < prev - 5 {
-                let hadWarned = (announced[key] ?? 0) >= 80
-                announced[key] = nil
-                projectionAnnounced.remove(key)
-                if hadWarned {
-                    post(title: "\(bar.label) has reset",
-                         body: "Back to \(Int(bar.percent))% — you're good to go.",
-                         id: "reset-\(key)")
+            // A meaningful drop means the window rolled over.
+            if let prior = peak[key], bar.percent < prior - 5 {
+                if prior >= 80 {
+                    fire(.reset, bar, now: now,
+                         title: "\(bar.label) has reset",
+                         body: "Back down to \(Int(bar.percent))% — you're good to go.")
                 }
+                peak[key] = bar.percent
+            } else {
+                peak[key] = max(peak[key] ?? 0, bar.percent)
             }
 
             for threshold in [95.0, 80.0] where bar.percent >= threshold {
-                if (announced[key] ?? 0) < threshold {
-                    announced[key] = threshold
-                    let resets = bar.resetsAt.map { " Resets \(shortResetText($0))." } ?? ""
-                    post(title: "\(bar.label): \(Int(bar.percent))% used",
-                         body: threshold >= 95
-                             ? "Almost exhausted.\(resets)"
-                             : "Getting close — lighter models stretch it.\(resets)",
-                         id: "limit-\(key)")
-                }
-                break
+                let resets = bar.resetsAt.map { " Resets \(shortResetText($0))." } ?? ""
+                fire(.nearLimit, bar, now: now, suffix: "\(Int(threshold))",
+                     title: "\(bar.label): \(Int(bar.percent))% used",
+                     body: threshold >= 95
+                         ? "Almost exhausted.\(resets)"
+                         : "Getting close — lighter models stretch it.\(resets)")
+                break   // 95 supersedes 80
             }
 
-            if !projectionAnnounced.contains(key), bar.percent < 80,
-               let hit = LimitTracker.shared.projectedHit(bar, now: now) {
-                projectionAnnounced.insert(key)
-                post(title: "On pace to hit \(bar.label)",
-                     body: "At the current pace it runs out around \(timeHM(hit)), before it resets.",
-                     id: "proj-\(key)")
+            if bar.percent < 80, let hit = LimitTracker.shared.projectedHit(bar, now: now) {
+                fire(.projected, bar, now: now,
+                     title: "On pace to hit \(bar.label)",
+                     body: "At the current pace it runs out around \(timeHM(hit)), before it resets.")
+            }
+
+            // Use-it-or-lose-it: capacity left in a window that's about to roll
+            // over is capacity wasted.
+            if let resets = bar.resetsAt, bar.percent <= 75 {
+                let left = resets.timeIntervalSince(now)
+                if left > 0, left <= headroomLead(bar) {
+                    fire(.headroom, bar, now: now,
+                         title: "\(bar.label) resets \(shortResetText(resets))",
+                         body: "\(Int(100 - bar.percent))% of it is still unused — a good window for the heavy work.")
+                }
             }
         }
     }
 
-    private func post(title: String, body: String, id: String) {
+    /// Posts once per (kind, limit, window). `suffix` distinguishes events of the
+    /// same kind within one window, e.g. the 80% and 95% thresholds.
+    private func fire(_ kind: NotifyKind, _ bar: LimitBar, now: Date,
+                      suffix: String = "", title: String, body: String) {
+        guard kind.enabled else { return }
+        // Windowless limits fall back to the current window's peak-drop tracking.
+        let window = bar.resetsAt.map { String(Int($0.timeIntervalSince1970)) } ?? "none"
+        let id = "\(kind.rawValue)|\(bar.trackerKey)|\(suffix)|\(window)"
+        guard fired[id] == nil else { return }
+
+        // Keep the record only while its window can still recur.
+        let expiry = (bar.resetsAt ?? now).addingTimeInterval(3600).timeIntervalSince1970
+        fired[id] = expiry
+        fired = fired.filter { $0.value > now.timeIntervalSince1970 }
+        UserDefaults.standard.set(fired, forKey: "notifyFired")
+
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -1208,6 +1269,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         refresh()
     }
 
+    @objc private func toggleNotifyKind(_ sender: NSMenuItem) {
+        if let kind = NotifyKind(rawValue: sender.representedObject as? String ?? "") {
+            kind.enabled.toggle()
+            refresh()
+        }
+    }
+
     @objc private func explain() {
         let alert = NSAlert()
         alert.messageText = "What am I looking at?"
@@ -1230,6 +1298,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         TODAY / LAST 7 DAYS — local totals. Cost is what this usage would cost at \
         list API prices — on a Pro/Max subscription you don't actually pay it; it's \
         a sense of scale, and of what each limit window "buys" you.
+
+        NOTIFICATIONS — four kinds, each switchable on its own: passing 80% / 95% \
+        of a limit, being on pace to hit one before it resets, a window about to \
+        reset with capacity still unused (spend it or lose it), and a spent limit \
+        rolling over. Each fires at most once per limit per window.
         """
         alert.addButton(withTitle: "Got it")
         NSApp.activate(ignoringOtherApps: true)
@@ -1418,11 +1491,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         display.submenu = sub
         menu.addItem(display)
 
-        let notify = NSMenuItem(title: "Notify when limits run low",
+        let notify = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
+        let nsub = NSMenu()
+        let master = NSMenuItem(title: "Enable notifications",
                                 action: #selector(toggleNotifications), keyEquivalent: "")
-        notify.target = self
-        notify.state = LimitNotifier.shared.enabled ? .on : .off
-        notify.toolTip = "Notifies at 80% and 95% of any limit, when you're on pace to hit one, and when a nearly-spent limit resets"
+        master.target = self
+        master.state = LimitNotifier.shared.enabled ? .on : .off
+        nsub.addItem(master)
+        nsub.addItem(.separator())
+        for kind in NotifyKind.allCases {
+            let i = NSMenuItem(title: kind.label, action: #selector(toggleNotifyKind(_:)), keyEquivalent: "")
+            // Leave them visible but inert when the master switch is off, so it's
+            // clear what would fire if it were on.
+            i.target = LimitNotifier.shared.enabled ? self : nil
+            i.representedObject = kind.rawValue
+            i.state = kind.enabled ? .on : .off
+            i.toolTip = kind.detail
+            nsub.addItem(i)
+        }
+        notify.submenu = nsub
         menu.addItem(notify)
 
         let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")

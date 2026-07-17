@@ -10,9 +10,13 @@ computed locally from the transcript logs in `~/.claude/projects`.
 `CC 1.3M · $10.30` for the current 5-hour block (`CC idle` when there is no
 active block).
 
-**Notifications** (on by default, toggleable): fires once per limit window
-when a limit crosses 80% and again at 95%, when your current pace would
-exhaust a limit before it resets, and when a nearly-spent limit resets.
+**Notifications** — four kinds, each switchable on its own (plus a master
+switch), every one firing at most once per limit per window:
+- **Approaching a limit** — passing 80%, then 95%
+- **On pace to hit a limit** — the current pace would exhaust it before it resets
+- **Unused capacity before a reset** — 30 min before a 5-hour window resets (1
+  hour for weekly ones) while ≥25% of it is still unused: spend it or lose it
+- **A spent limit has reset** — a limit you nearly used up has rolled over
 
 **Dropdown menu:**
 - Plan usage limits as circular gauges (5-hour, weekly, per-model) with reset
