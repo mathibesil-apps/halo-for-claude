@@ -1,5 +1,4 @@
 import AppKit
-import CryptoKit
 import Foundation
 import ServiceManagement
 import UserNotifications
@@ -250,7 +249,7 @@ final class LimitTracker {
     static let shared = LimitTracker()
     private let key = "limitHistory"
     private let maxAge: TimeInterval = 3 * 3600
-    private let queue = DispatchQueue(label: "com.mathiasbesil.claude-usage.limittracker")
+    private let queue = DispatchQueue(label: "com.mathiasbesil.halo.limittracker")
     /// trackerKey -> [(unix time, percent)]
     private var series: [String: [[Double]]]
 
@@ -427,20 +426,38 @@ final class LimitNotifier {
     }
 }
 
+/// Why the plan-limit section has nothing to show.
+enum LimitsStatus {
+    case ok
+    case noClaudeCode      // Claude Code isn't signed in on this Mac
+    case keychainDenied    // the user declined this app's Keychain request
+    case expired           // Claude Code's token has lapsed; only it can renew
+
+    var hint: String? {
+        switch self {
+        case .ok: return nil
+        case .noClaudeCode: return "Sign in to Claude Code (run `claude` in a terminal) to see plan limits"
+        case .keychainDenied: return "Keychain access denied — Halo needs it to read Claude Code's login"
+        case .expired: return "Claude Code's login has expired — use Claude Code once to renew it"
+        }
+    }
+}
+
+/// Reads the plan limits for the account Claude Code is already logged into.
+///
+/// It reuses the token Claude Code stored in the Keychain rather than running
+/// its own OAuth flow, so Halo never presents itself to Anthropic as the Claude
+/// Code client, and there's nothing to sign in to. The token is read-only:
+/// renewal is Claude Code's job, and using it renews it.
 final class ClaudeAccount {
     static let shared = ClaudeAccount()
-    private let clientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    private let redirectUri = "https://console.anthropic.com/oauth/code/callback"
-    private let keychainService = "com.mathiasbesil.claude-usage"
-    private let queue = DispatchQueue(label: "com.mathiasbesil.claude-usage.oauth")
+    private let keychainService = "Claude Code-credentials"
+    private let queue = DispatchQueue(label: "com.mathiasbesil.halo.account")
 
-    private struct Tokens: Codable {
+    private struct Tokens {
         var accessToken: String
-        var refreshToken: String
         var expiresAt: Date
     }
-    private var pendingVerifier: String?
-    private var pendingState: String?
 
     /// Last successful limits, reused while a fetch is failing or rate-limited.
     private var cachedLimits: LimitsSnapshot?
@@ -453,172 +470,96 @@ final class ClaudeAccount {
     private var backoff: TimeInterval = 0
     /// Whether the last attempted fetch failed; drives the stale marker.
     private var fetchFailing = false
+    /// Why limits are unavailable, for the menu to explain. Set on every fetch.
+    private var lastStatus: LimitsStatus = .ok
     private let fetchFloor: TimeInterval = 5
     private let pollInterval: TimeInterval = 120
     private let maxBackoff: TimeInterval = 15 * 60
 
-    // MARK: Keychain
+    var status: LimitsStatus { queue.sync { lastStatus } }
 
-    private func loadTokens() -> Tokens? {
+    // MARK: Claude Code's Keychain credentials (read-only)
+
+    private enum Credentials {
+        case ok(Tokens)
+        case missing
+        case denied
+    }
+
+    private func loadCredentials() -> Credentials {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecReturnData as String: true,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return try? JSONDecoder().decode(Tokens.self, from: data)
-    }
-
-    private func saveTokens(_ t: Tokens) {
-        guard let data = try? JSONEncoder().encode(t) else { return }
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-        ]
-        if SecItemUpdate(base as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecItemNotFound {
-            var add = base
-            add[kSecValueData as String] = data
-            SecItemAdd(add as CFDictionary, nil)
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            guard let data = item as? Data, let t = Self.parseCredentials(data) else {
+                NSLog("Claude Code credentials present but unreadable")
+                return .missing
+            }
+            return .ok(t)
+        case errSecItemNotFound:
+            return .missing
+        default:
+            // Most often the user clicked Deny on the Keychain prompt.
+            NSLog("keychain read failed (OSStatus \(status))")
+            return .denied
         }
     }
 
-    func signOut() {
-        SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-        ] as CFDictionary)
-        resetFetchState()
-    }
-
-    /// Clears cache, backoff, and gates — auth state changed, old pacing is moot.
-    private func resetFetchState() {
-        queue.sync {
-            cachedLimits = nil
-            backoff = 0
-            fetchFailing = false
-            nextFetchAllowed = .distantPast
-            nextPoll = .distantPast
+    /// Claude Code writes `{"claudeAiOauth": {"accessToken": …, "expiresAt": …}}`.
+    /// Parsed defensively: the fields are also accepted at the top level and in
+    /// snake_case, and `expiresAt` in either seconds or milliseconds, so a change
+    /// on their side degrades to "no limits" rather than a crash.
+    private static func parseCredentials(_ data: Data) -> Tokens? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        for dict in [root["claudeAiOauth"] as? [String: Any], root].compactMap({ $0 }) {
+            guard let token = (dict["accessToken"] ?? dict["access_token"]) as? String,
+                  !token.isEmpty else { continue }
+            // Without an expiry, assume it's live and let a 401 correct us.
+            var expires = Date.distantFuture
+            if let raw = (dict["expiresAt"] ?? dict["expires_at"]) as? Double {
+                expires = Date(timeIntervalSince1970: raw > 1e11 ? raw / 1000 : raw)
+            }
+            return Tokens(accessToken: token, expiresAt: expires)
         }
+        return nil
     }
 
-    var isSignedIn: Bool { loadTokens() != nil }
-
-    // MARK: Sign-in (PKCE, manual code paste)
-
-    /// Opens the authorize page in the default browser; returns nothing.
-    /// Call `completeSignIn(pastedCode:)` with the code the user pastes back.
-    func beginSignIn() {
-        let verifier = Self.randomURLSafe(43)
-        let state = Self.randomURLSafe(32)
-        pendingVerifier = verifier
-        pendingState = state
-        let challenge = Data(SHA256.hash(data: Data(verifier.utf8)))
-            .base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        var comps = URLComponents(string: "https://claude.ai/oauth/authorize")!
-        comps.queryItems = [
-            .init(name: "code", value: "true"),
-            .init(name: "client_id", value: clientId),
-            .init(name: "response_type", value: "code"),
-            .init(name: "redirect_uri", value: redirectUri),
-            .init(name: "scope", value: "org:create_api_key user:profile user:inference"),
-            .init(name: "code_challenge", value: challenge),
-            .init(name: "code_challenge_method", value: "S256"),
-            .init(name: "state", value: state),
-        ]
-        NSWorkspace.shared.open(comps.url!)
+    /// True when Claude Code has a login on this Mac that we can read.
+    var isSignedIn: Bool {
+        if case .ok = loadCredentials() { return true }
+        return false
     }
 
-    func completeSignIn(pastedCode: String) -> String? {
-        guard let verifier = pendingVerifier else { return "No sign-in in progress" }
-        let trimmed = pastedCode.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = trimmed.split(separator: "#", maxSplits: 1).map(String.init)
-        let code = parts.first ?? ""
-        let state = parts.count > 1 ? parts[1] : (pendingState ?? "")
-        guard !code.isEmpty else { return "Empty code" }
-
-        var body: [String: Any] = [
-            "grant_type": "authorization_code",
-            "code": code,
-            "state": state,
-            "client_id": clientId,
-            "redirect_uri": redirectUri,
-            "code_verifier": verifier,
-        ]
-        switch postToken(body: &body) {
-        case .success(let t):
-            saveTokens(t)
-            pendingVerifier = nil
-            pendingState = nil
-            resetFetchState()
-            return nil
-        case .failure(let err):
-            return err.message
-        }
-    }
-
-    private struct OAuthError: Error {
-        let message: String
-        let status: Int
-        /// True when the server rejected the credentials themselves, as opposed
-        /// to a network blip / outage / rate limit.
-        var isAuthRejection: Bool { (400...403).contains(status) }
-    }
-
-    private func postToken(body: inout [String: Any]) -> Result<Tokens, OAuthError> {
-        var req = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let (data, status, _) = Self.syncRequest(req)
-        guard let data, status == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let access = obj["access_token"] as? String else {
-            let detail = (data.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(200)
-            return .failure(OAuthError(message: "Token request failed (HTTP \(status)): \(detail)",
-                                       status: status))
-        }
-        let expiresIn = (obj["expires_in"] as? Double) ?? 3600
-        return .success(Tokens(
-            accessToken: access,
-            refreshToken: (obj["refresh_token"] as? String) ?? "",
-            expiresAt: Date().addingTimeInterval(expiresIn - 60)
-        ))
-    }
-
-    // MARK: Access token with refresh
+    // MARK: Access token
 
     private enum TokenResult {
         case valid(String)
-        case transient      // network blip / outage — credentials may still be fine
-        case unauthorized   // no tokens, or the server rejected them
+        case expired        // Claude Code must renew it; using Claude Code does
+        case unauthorized   // no readable Claude Code login
     }
 
     private func validAccessToken() -> TokenResult {
-        queue.sync { () -> TokenResult in
-            guard var t = loadTokens() else { return .unauthorized }
-            if t.expiresAt > Date() { return .valid(t.accessToken) }
-            guard !t.refreshToken.isEmpty else { return .unauthorized }
-            var body: [String: Any] = [
-                "grant_type": "refresh_token",
-                "refresh_token": t.refreshToken,
-                "client_id": clientId,
-            ]
-            switch postToken(body: &body) {
-            case .success(let fresh):
-                var merged = fresh
-                if merged.refreshToken.isEmpty { merged.refreshToken = t.refreshToken }
-                saveTokens(merged)
-                t = merged
-                return .valid(t.accessToken)
-            case .failure(let err):
-                NSLog("token refresh failed: \(err.message)")
-                return err.isAuthRejection ? .unauthorized : .transient
+        switch loadCredentials() {
+        case .missing:
+            queue.sync { lastStatus = .noClaudeCode }
+            return .unauthorized
+        case .denied:
+            queue.sync { lastStatus = .keychainDenied }
+            return .unauthorized
+        case .ok(let t):
+            // Renewing would mean posting as Claude Code's OAuth client, which is
+            // exactly what this app avoids; Claude Code refreshes it in normal use.
+            guard t.expiresAt > Date() else {
+                queue.sync { lastStatus = .expired }
+                return .expired
             }
+            queue.sync { lastStatus = .ok }
+            return .valid(t.accessToken)
         }
     }
 
@@ -646,11 +587,15 @@ final class ClaudeAccount {
         let token: String
         switch validAccessToken() {
         case .unauthorized:
+            queue.sync { cachedLimits = nil }
             return nil
-        case .transient:
-            // Credentials are probably fine; keep showing the last good bars and
-            // back off the polling instead of hammering the token endpoint.
-            noteFailure(status: 0, headers: [:], detail: "token refresh unreachable")
+        case .expired:
+            // Nothing to retry until Claude Code renews it, so don't spend
+            // requests; keep the last good bars marked stale.
+            queue.sync {
+                fetchFailing = true
+                nextPoll = Date().addingTimeInterval(pollInterval)
+            }
             return cached?.markedStale()
                 ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: true)
         case .valid(let t):
@@ -663,7 +608,9 @@ final class ClaudeAccount {
         let (data, status, headers) = Self.syncRequest(req)
 
         if status == 401 || status == 403 {
+            // The token Claude Code gave us is no longer good for this.
             NSLog("usage fetch unauthorized (HTTP \(status))")
+            queue.sync { lastStatus = .expired; cachedLimits = nil }
             return nil
         }
         guard let data, status == 200,
@@ -836,15 +783,6 @@ final class ClaudeAccount {
         sem.wait()
         return (outData, outStatus, outHeaders)
     }
-
-    private static func randomURLSafe(_ len: Int) -> String {
-        let chars = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
-        var out = ""
-        for _ in 0..<len {
-            out.append(chars[Int.random(in: 0..<chars.count)])
-        }
-        return out
-    }
 }
 
 // MARK: - Usage snapshot
@@ -873,7 +811,9 @@ struct Insight {
 }
 
 struct Snapshot {
-    var limits: LimitsSnapshot?    // nil = not signed in / auth failed
+    var limits: LimitsSnapshot?    // nil = no readable Claude Code login
+    /// Why `limits` is nil, phrased for the menu.
+    var limitsHint: String?
     var block: BlockStats?
     var today: Stats
     var week: Stats
@@ -1018,6 +958,7 @@ enum UsageMath {
 
         return Snapshot(
             limits: limits,
+            limitsHint: ClaudeAccount.shared.status.hint,
             block: activeBlock(entries: all, now: now),
             today: today,
             week: Stats(entries: all),
@@ -1196,7 +1137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private let reader = UsageReader()
     private var timer: Timer?
     // UsageReader's cache is not thread-safe; all refreshes go through this serial queue.
-    private let refreshQueue = DispatchQueue(label: "com.mathiasbesil.claude-usage.refresh", qos: .utility)
+    private let refreshQueue = DispatchQueue(label: "com.mathiasbesil.halo.refresh", qos: .utility)
 
     private enum TitleMode: String, CaseIterable {
         case both, tokens, cost
@@ -1287,6 +1228,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         turns orange at 70% and red at 90%; the time under it is when it resets. \
         100% means Claude stops answering until the reset.
 
+        There's no sign-in: Halo reads the login Claude Code already keeps in your \
+        Keychain, which is why macOS asked your permission once. Nothing is sent \
+        anywhere except your own request to Anthropic for those percentages.
+
         CURRENT 5-HOUR SESSION — tokens and estimated cost of your ongoing Claude \
         Code activity, read from the local logs in ~/.claude. "Burn rate" is tokens \
         per minute in this window.
@@ -1307,41 +1252,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         alert.addButton(withTitle: "Got it")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
-    }
-
-    @objc private func signIn() {
-        ClaudeAccount.shared.beginSignIn()
-
-        let alert = NSAlert()
-        alert.messageText = "Sign in to Claude"
-        alert.informativeText = "Your browser opened claude.ai. Approve access, then paste the code shown here."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "Paste authorization code"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Sign in")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let code = field.stringValue
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let error = ClaudeAccount.shared.completeSignIn(pastedCode: code)
-            DispatchQueue.main.async {
-                if let error {
-                    let fail = NSAlert()
-                    fail.messageText = "Sign-in failed"
-                    fail.informativeText = error
-                    fail.runModal()
-                } else {
-                    self?.refresh(forceLimits: true)
-                }
-            }
-        }
-    }
-
-    @objc private func signOut() {
-        ClaudeAccount.shared.signOut()
-        refresh()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -1389,11 +1299,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             rings.view = RingGaugesView(bars)
             menu.addItem(rings)
             menu.addItem(.separator())
-        } else if snap.limits == nil {
-            let s = NSMenuItem(title: "Sign in to Claude for usage limits…",
-                               action: #selector(signIn), keyEquivalent: "")
-            s.target = self
-            menu.addItem(s)
+        } else if snap.limits == nil, let hint = snap.limitsHint {
+            menu.addItem(coloredInfo([(hint, .secondaryLabelColor)], size: 12))
             menu.addItem(.separator())
         }
 
@@ -1516,12 +1423,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         login.target = self
         login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
         menu.addItem(login)
-
-        if ClaudeAccount.shared.isSignedIn {
-            let out = NSMenuItem(title: "Sign out of Claude", action: #selector(signOut), keyEquivalent: "")
-            out.target = self
-            menu.addItem(out)
-        }
 
         menu.addItem(.separator())
         let help = NSMenuItem(title: "What do these numbers mean?", action: #selector(explain), keyEquivalent: "")
