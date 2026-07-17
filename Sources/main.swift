@@ -64,7 +64,7 @@ enum Pricing {
 
     static func rate(for model: String) -> Rate {
         let m = model.lowercased()
-        if m.contains("opus") || m.contains("fable") || m.contains("mythos") {
+        if m.contains("opus") || m.contains("fable") {
             return Rate(input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.5)
         }
         if m.contains("haiku") {
@@ -76,7 +76,7 @@ enum Pricing {
 
     static func shortName(_ model: String) -> String {
         let m = model.lowercased()
-        for name in ["fable", "mythos", "opus", "sonnet", "haiku"] where m.contains(name) {
+        for name in ["fable", "opus", "sonnet", "haiku"] where m.contains(name) {
             return name.capitalized
         }
         return model.isEmpty ? "unknown" : model
@@ -621,7 +621,6 @@ final class ClaudeAccount {
                 ?? LimitsSnapshot(bars: [], fetchedAt: now, stale: true)
         }
 
-        UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: "lastUsageJSON")
         let fresh = LimitsSnapshot(bars: Self.parseLimits(obj), fetchedAt: Date(), stale: false)
         queue.sync {
             backoff = 0
@@ -1445,7 +1444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private static let modelDots: [String: NSColor] = [
-        "Fable": .systemPurple, "Mythos": .systemPurple, "Opus": .systemIndigo,
+        "Fable": .systemPurple, "Opus": .systemIndigo,
         "Sonnet": .systemBlue, "Haiku": .systemTeal,
     ]
 
