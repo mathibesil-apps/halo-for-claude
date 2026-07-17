@@ -3,12 +3,19 @@
 Claude Code usage in your macOS menu bar — how much of each plan limit you've
 burned, at a glance, with a nudge before you hit one.
 
-```
-◔ 5h 21%   ◔ Wk 22%   ◔ F 43%
-```
+<p align="center">
+  <img src="docs/menubar.png" alt="Menu bar showing 5-hour, weekly, and per-model limits" width="220">
+</p>
 
 One ring per plan limit, filling clockwise, green → orange at 70% → red at 90%.
 Click it for reset times, what's driving your spend, and what to do about it.
+
+<p align="center">
+  <img src="docs/menu.png" alt="Halo for Claude menu with plan limits, insights, sessions, and daily totals" width="340">
+</p>
+
+<sub>Project names in this screenshot are anonymized (demo mode) — your real
+ones appear in the app.</sub>
 
 > **Unofficial.** Not affiliated with or endorsed by Anthropic. It reads a
 > usage endpoint that isn't a documented public API, so it may break without
@@ -87,6 +94,9 @@ New to the numbers? The menu has a **"What do these numbers mean?"** explainer.
   machine has one, otherwise ad-hoc. Ad-hoc signatures change on every build, so
   macOS re-asks for Keychain access each time you rebuild — harmless, just
   click Always Allow. Override with `CODESIGN_ID="..." ./build.sh`.
+- **Demo mode** (for docs screenshots) anonymizes project names:
+  `defaults write com.mathiasbesil.halo demoMode -bool true`, relaunch, capture,
+  then `-bool false` and relaunch to restore your real names.
 
 ## License
 
