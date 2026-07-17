@@ -28,19 +28,22 @@ open /Applications/Halo.app
 
 Then, in the menu: **Launch at login**.
 
-## There's no sign-in
+## Sign-in (usually none)
 
-If you use Claude Code, you're already signed in. Halo reads the login Claude
-Code keeps in your macOS Keychain instead of running its own OAuth flow — so
-macOS will ask your permission once (**Always Allow**), and the rings appear.
+Halo first tries the login Claude Code already keeps in your macOS Keychain —
+macOS asks your permission once (**Always Allow**) and, for most installs, the
+rings just appear. That path is strictly read-only: Halo never writes to Claude
+Code's Keychain item, and if the stored token has aged it renews it in memory
+the same way Claude Code itself does on each run.
 
-It never runs a sign-in, never asks for a password, and never sends your token
-anywhere except your own request to Anthropic for your own percentages. It only
-ever *reads* that Keychain item; renewing the login is Claude Code's job, which
-happens whenever you use Claude Code.
+If your machine has no usable stored login (some setups keep it elsewhere),
+the menu offers **Connect to Claude…** — a standard OAuth flow in your
+browser; paste the code back and Halo keeps its own connection in its own
+Keychain item from then on. **Disconnect from Claude** removes it.
 
-Not signed into Claude Code? Everything below the rings still works — token and
-cost stats come from your local logs.
+Either way it never asks for a password and never talks to anything except
+Anthropic. Not connected at all? Everything below the rings still works —
+token and cost stats come from your local logs.
 
 ## What you get
 
