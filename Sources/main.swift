@@ -1396,6 +1396,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var statusItem: NSStatusItem!
     private let reader = UsageReader()
     private var timer: Timer?
+    private var loadingTimer: Timer?
+    private var loadingDots = 0
     // UsageReader's cache is not thread-safe; all refreshes go through this serial queue.
     private let refreshQueue = DispatchQueue(label: "com.mathiasbesil.halo.refresh", qos: .utility)
 
@@ -1431,8 +1433,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "CC …"
-        statusItem.menu = NSMenu()
+        startLoadingAnimation()
+        // A populated menu from the first frame, so the icon is clickable while
+        // the first fetch (Keychain read + network) is still in flight — render()
+        // swaps in the real content, or the Connect button, once it lands.
+        statusItem.menu = loadingMenu()
         UNUserNotificationCenter.current().delegate = self
         if LimitNotifier.shared.enabled { LimitNotifier.shared.requestAuthorization() }
         refresh()
@@ -1574,6 +1579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func render(_ snap: Snapshot, now: Date) {
+        stopLoadingAnimation()   // real data has landed; drop the "Halo…" placeholder
         let menu = NSMenu()
 
         // Account limit gauges (like claude.ai's usage popup)
@@ -1639,9 +1645,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let s = b.stats
             if bars.isEmpty {
                 switch titleMode {
-                case .both: statusItem.button?.title = "CC \(compactTokens(s.totalTokens)) · \(money(s.cost))"
-                case .tokens: statusItem.button?.title = "CC \(compactTokens(s.totalTokens))"
-                case .cost: statusItem.button?.title = "CC \(money(s.cost))"
+                case .both: statusItem.button?.title = "Halo \(compactTokens(s.totalTokens)) · \(money(s.cost))"
+                case .tokens: statusItem.button?.title = "Halo \(compactTokens(s.totalTokens))"
+                case .cost: statusItem.button?.title = "Halo \(money(s.cost))"
                 }
             }
 
@@ -1661,7 +1667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             addModelBreakdown(s, to: menu)
         } else {
             if bars.isEmpty {
-                statusItem.button?.title = "CC idle"
+                statusItem.button?.title = "Halo idle"
             }
             menu.addItem(header("No active 5h block"))
         }
@@ -1818,6 +1824,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                        radius: 5.5, lineWidth: 2.5, percent: percent)
             return true
         }
+    }
+
+    /// Animated "Halo…" in the menu bar while the first snapshot is in flight.
+    private func startLoadingAnimation() {
+        loadingDots = 0
+        statusItem.button?.title = "Halo"
+        loadingTimer?.invalidate()
+        loadingTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.loadingDots = (self.loadingDots + 1) % 4
+            self.statusItem.button?.title = "Halo" + String(repeating: ".", count: self.loadingDots)
+        }
+    }
+
+    private func stopLoadingAnimation() {
+        loadingTimer?.invalidate()
+        loadingTimer = nil
+    }
+
+    /// Placeholder menu shown before the first snapshot lands, so a fresh launch
+    /// is never a blank, unclickable icon.
+    private func loadingMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(header("Halo for Claude"))
+        menu.addItem(coloredInfo([("Loading usage… macOS may ask to read Claude Code's login.",
+                                   .secondaryLabelColor)], size: 12))
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        return menu
     }
 
     private func header(_ s: String) -> NSMenuItem {
