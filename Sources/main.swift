@@ -1306,22 +1306,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Sets the status bar to a colored ring for the worst limit plus per-limit
-    /// percentages, each tinted once it approaches its limit.
+    /// Sets the status bar to one colored progress ring per limit, each
+    /// followed by its label and percentage, tinted once it approaches the
+    /// limit.
     private func setStatusTitle(_ bars: [LimitBar]) {
-        let worst = bars.map { $0.percent }.max() ?? 0
-        statusItem.button?.image = Self.ringIcon(percent: worst)
-        statusItem.button?.imagePosition = .imageLeft
+        // Rings live inline in the attributed title (one per limit), so the
+        // standalone button image is unused.
+        statusItem.button?.image = nil
 
         let title = NSMutableAttributedString()
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         for (i, bar) in bars.enumerated() {
             if i > 0 { title.append(NSAttributedString(string: "  ")) }
+
+            let attachment = NSTextAttachment()
+            attachment.image = Self.ringIcon(percent: bar.percent)
+            // Center the 15pt ring on the 12pt text's visual middle.
+            attachment.bounds = CGRect(x: 0, y: (font.capHeight - 15) / 2, width: 15, height: 15)
+            title.append(NSAttributedString(attachment: attachment))
+
             // Tint only when worth noticing; default color otherwise so the
             // status bar stays quiet-looking at normal usage.
             let color: NSColor = bar.percent >= 70 ? limitColor(bar.percent) : .labelColor
             title.append(NSAttributedString(
-                string: String(format: "%@ %.0f%%", bar.shortLabel, bar.percent),
+                string: String(format: " %@ %.0f%%", bar.shortLabel, bar.percent),
                 attributes: [.font: font, .foregroundColor: color, .baselineOffset: -0.5]))
         }
         statusItem.button?.attributedTitle = title
