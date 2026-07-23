@@ -21,6 +21,10 @@ ones appear in the app.</sub>
 > usage endpoint that isn't a documented public API, so it may break without
 > warning.
 
+<p align="center">
+  <a href="https://buymeacoffee.com/mathias.besil"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
+</p>
+
 ## Install
 
 ### Download (easiest)
@@ -122,6 +126,12 @@ xcrun notarytool store-credentials "halo-notary" \
 
 Then `./release.sh` produces `Halo-for-Claude.dmg`, which is uploaded as a
 GitHub Release asset (the `.dmg` itself is git-ignored).
+
+## Support
+
+Halo is free and open-source. If it saves you from blowing a limit, you can
+[buy me a coffee](https://buymeacoffee.com/mathias.besil) ☕ — entirely optional,
+always appreciated.
 
 ## License
 
