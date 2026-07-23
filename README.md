@@ -37,7 +37,8 @@ ones appear in the app.</sub>
 open it, and drag **Halo for Claude** into Applications. It's signed and
 notarized by Apple, so it opens with a double-click — no security warnings.
 
-Then, in the menu: **Launch at login**.
+Universal (Apple Silicon + Intel). Requires macOS 13 (Ventura) or later. Then,
+in the menu: **Launch at login**.
 
 ### Build from source
 
@@ -70,19 +71,35 @@ token and cost stats come from your local logs.
 
 ## Where the plan limits come from
 
-Halo resolves the ring percentages from the best source available, and labels
-which one it used:
+On first launch Halo asks how you'd like it to read your limits — and you can
+change it anytime from **Plan limits source** in the menu:
 
-1. **Official (recommended)** — Claude Code itself can hand Halo its real 5-hour
-   and weekly limits, locally, with **no network call and no token**. Turn it on
-   from the menu: **Use Claude Code's official limits** (it adds a `statusLine`
-   entry to `~/.claude/settings.json`, with your consent and a backup). This is
-   the most reliable source and doesn't touch any Anthropic endpoint.
-2. **Live** — the account usage endpoint (accurate, but an undocumented API that
-   can change).
-3. **Estimated** — if neither is available, Halo estimates your 5-hour usage from
-   local logs against a self-calibrating cap, so the ring keeps working. The menu
-   marks these as *estimated*.
+<p align="center">
+  <img src="docs/wizard.png" alt="First-run welcome: choose Automatic or Local for reading plan limits" width="440">
+</p>
+<p align="center">
+  <img src="docs/limits-explainer.png" alt="What's the difference? explainer for the three limit sources" width="330">
+</p>
+
+- **Automatic** *(recommended)* — the best source available, no setup: Claude
+  Code's official limits if you've set them up, otherwise your Claude login to
+  fetch exact numbers, otherwise a local estimate. Offers to connect if there's
+  no login on your Mac.
+- **Local — no token, no network** — never reads your login or contacts
+  Anthropic. Uses Claude Code's official limits (if set up) or an estimate from
+  your local logs. The most private option, and it can't break if Anthropic
+  changes anything.
+- **Anthropic account (token)** — reads the login Claude Code keeps in your
+  Keychain and asks Anthropic for the exact numbers (including usage from your
+  other devices). Most accurate, but the endpoint isn't a documented public API.
+
+**Official limits** (used by Automatic and Local) let Claude Code hand Halo its
+real 5-hour and weekly limits locally — no network, no token. Set it up from the
+menu; it adds a `statusLine` entry to `~/.claude/settings.json` (with your
+consent and a backup). Note it's **global** — it applies to all your Claude Code
+sessions, including work ones — and never touches your login.
+
+Each ring is labeled by source: **official / live / estimated**.
 
 ## What you get
 
