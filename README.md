@@ -1,4 +1,8 @@
-# Halo for Claude
+<p align="center">
+  <img src="icon/AppIcon-1024.png" width="128" alt="Halo for Claude icon">
+</p>
+
+<h1 align="center">Halo for Claude</h1>
 
 Claude Code usage in your macOS menu bar — how much of each plan limit you've
 burned, at a glance, with a nudge before you hit one.
