@@ -5,9 +5,21 @@ cd "$(dirname "$0")"
 
 APP="Halo for Claude.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O -o "$APP/Contents/MacOS/Halo" Sources/main.swift
+
+# App icon: build AppIcon.icns from the 1024px source (sips + iconutil ship with macOS).
+if [ -f icon/AppIcon-1024.png ]; then
+    ICONSET=$(mktemp -d)/AppIcon.iconset
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z $size $size          icon/AppIcon-1024.png --out "$ICONSET/icon_${size}x${size}.png"     >/dev/null
+        sips -z $((size*2)) $((size*2)) icon/AppIcon-1024.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+    rm -rf "$(dirname "$ICONSET")"
+fi
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -17,8 +29,9 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>Halo</string>
     <key>CFBundleIdentifier</key><string>com.mathiasbesil.halo</string>
     <key>CFBundleName</key><string>Halo for Claude</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.02</string>
+    <key>CFBundleShortVersionString</key><string>0.03</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
