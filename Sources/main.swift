@@ -236,6 +236,14 @@ final class UsageReader {
 
 // MARK: - Claude account OAuth (own token, stored in this app's Keychain item)
 
+/// Where a limit percentage came from, best-to-worst. Shown in the UI so an
+/// estimate is never presented as account-truth.
+enum LimitSource: String {
+    case official    // Claude Code's own statusline hand-off — local, no network, no token
+    case live        // the OAuth usage endpoint — real, but an undocumented API
+    case estimated   // computed locally from ~/.claude logs when nothing better is available
+}
+
 struct LimitBar {
     let kind: String           // stable identity from the API, e.g. "session", "weekly_all"
     let scopeName: String?     // model display name for scoped limits
@@ -243,6 +251,7 @@ struct LimitBar {
     let shortLabel: String     // for the menu bar title, e.g. "5h", "W", "F"
     let percent: Double        // 0–100
     let resetsAt: Date?
+    var source: LimitSource = .live
 
     /// Persistence key for history tracking; stable across label wording changes.
     var trackerKey: String { scopeName.map { "\(kind):\($0)" } ?? kind }
@@ -937,7 +946,8 @@ final class ClaudeAccount {
         isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var out: [LimitBar] = []
         for item in arr {
-            guard let percent = item["percent"] as? Double else { continue }
+            guard let raw = item["percent"] as? Double, raw.isFinite, raw <= 101 else { continue }
+            let percent = min(max(raw, 0), 100)
             let kind = (item["kind"] as? String) ?? ""
             let scopeName = ((item["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
             let label: String
@@ -983,8 +993,7 @@ final class ClaudeAccount {
         isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
         func bar(_ key: String, _ label: String, _ short: String, _ dict: [String: Any]) -> LimitBar? {
-            guard let raw = dict["utilization"] as? Double else { return nil }
-            let pct = raw <= 1.0 ? raw * 100 : raw
+            guard let pct = Statusline.cleanPercent(dict["utilization"]) else { return nil }
             var resets: Date? = nil
             if let s = dict["resets_at"] as? String {
                 resets = isoFrac.date(from: s) ?? iso.date(from: s)
@@ -1045,6 +1054,140 @@ final class ClaudeAccount {
     }
 }
 
+// MARK: - Official limits via Claude Code's statusline (local, no network, no token)
+
+/// Claude Code (v2.1.80+) pipes a session JSON — including `rate_limits` — to the
+/// configured statusline command on stdin. If the user points that command at
+/// `Halo --statusline`, we capture those *official* percentages to a local file
+/// and read them back, with zero network calls and no OAuth token. This is the
+/// safest source: it doesn't touch the undocumented usage endpoint at all.
+enum Statusline {
+    /// Where the captured rate_limits are cached between the statusline process
+    /// and the running app.
+    static var fileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".halo/statusline.json")
+    }
+
+    /// How long a capture is trusted as "fresh official" data. The statusline
+    /// only fires when the user prompts Claude Code; while idle, usage isn't
+    /// climbing, so a slightly stale capture is still accurate until its reset.
+    static let ttl: TimeInterval = 30 * 60
+
+    /// `Halo --statusline`: read Claude Code's JSON from stdin, stash the
+    /// rate_limits, and print a compact status line back. Fast, no AppKit.
+    static func capture() {
+        let input = FileHandle.standardInput.readDataToEndOfFile()
+        let root = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
+
+        // Persist rate_limits (if this Claude Code version provides them).
+        if let rl = root?["rate_limits"] as? [String: Any] {
+            let payload: [String: Any] = ["captured_at": Date().timeIntervalSince1970,
+                                          "rate_limits": rl]
+            if let data = try? JSONSerialization.data(withJSONObject: payload) {
+                try? FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? data.write(to: fileURL, options: .atomic)
+            }
+        }
+
+        // Print a useful one-liner so the user's status line still shows something.
+        var parts: [String] = []
+        if let model = (root?["model"] as? [String: Any])?["display_name"] as? String {
+            parts.append(model)
+        }
+        if let rl = root?["rate_limits"] as? [String: Any],
+           let five = rl["five_hour"] as? [String: Any],
+           let pct = cleanPercent(five["used_percentage"]) {
+            parts.append(String(format: "◔ 5h %.0f%%", pct))
+        }
+        FileHandle.standardOutput.write(Data((parts.joined(separator: "  ·  ")).utf8))
+    }
+
+    /// Official bars from the last capture, or nil if absent/stale/unconfigured.
+    static func read(now: Date = Date()) -> [LimitBar]? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let capturedAt = root["captured_at"] as? Double,
+              now.timeIntervalSince1970 - capturedAt < ttl,
+              let rl = root["rate_limits"] as? [String: Any] else { return nil }
+
+        let windows: [(String, String, String)] = [
+            ("five_hour", "5-hour limit", "5h"),
+            ("seven_day", "Weekly · all models", "Wk"),
+        ]
+        var bars: [LimitBar] = []
+        for (key, label, short) in windows {
+            guard let w = rl[key] as? [String: Any],
+                  let pct = cleanPercent(w["used_percentage"]) else { continue }
+            let resets = epochDate(w["resets_at"])
+            // A window past its reset has rolled over; show it as fresh (0%).
+            let rolled = resets.map { $0 <= now } ?? false
+            bars.append(LimitBar(kind: key, scopeName: nil, label: label, shortLabel: short,
+                                 percent: rolled ? 0 : pct,
+                                 resetsAt: rolled ? nil : resets, source: .official))
+        }
+        return bars.isEmpty ? nil : bars
+    }
+
+    /// Guards against a known Claude bug where used_percentage can leak the
+    /// resets_at epoch (a huge number). Accepts 0–1 fractions or 0–100 percents.
+    static func cleanPercent(_ raw: Any?) -> Double? {
+        guard let d = raw as? Double, d.isFinite else { return nil }
+        let v = (d > 0 && d <= 1) ? d * 100 : d
+        guard v <= 101 else { return nil }   // epoch leak / nonsense
+        return min(max(v, 0), 100)
+    }
+
+    static func epochDate(_ raw: Any?) -> Date? {
+        guard let n = raw as? Double, n > 0 else { return nil }
+        return Date(timeIntervalSince1970: n > 1e12 ? n / 1000 : n)
+    }
+}
+
+// MARK: - Local limit estimate (fallback when no official/live data is available)
+
+/// When neither the statusline nor the usage endpoint is available, estimate the
+/// 5-hour utilization from local logs: active-block tokens ÷ a plan cap. The cap
+/// self-calibrates from your own peak sessions (P90) so it isn't a blind guess.
+enum LocalEstimate {
+    /// Known per-5h token ceilings across tiers; used to recognize a session that
+    /// actually hit a limit, and as sane defaults.
+    static let ladder: [Int] = [19_000, 88_000, 220_000, 880_000]
+    static let defaultCap = 88_000   // ~Max 5x, a middle-of-the-road assumption
+
+    /// 90th-percentile cap from completed blocks that nearly maxed out; falls back
+    /// to the P90 of all completed blocks, then to a ladder default.
+    static func calibratedCap(blocks: [BlockStats], activeTokens: Int) -> Int {
+        let completed = blocks.dropLast().map { $0.stats.totalTokens }.filter { $0 > 0 }
+        let hitLimit = completed.filter { t in ladder.contains { t >= Int(Double($0) * 0.95) } }
+        let sample = hitLimit.isEmpty ? completed : hitLimit
+        guard let p90 = percentile90(sample) else {
+            // No history: pick the smallest ladder rung above the current block.
+            return ladder.first { $0 >= activeTokens } ?? max(activeTokens, defaultCap)
+        }
+        return max(p90, activeTokens)
+    }
+
+    static func percentile90(_ values: [Int]) -> Int? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let idx = Int((Double(sorted.count - 1) * 0.9).rounded())
+        return sorted[min(idx, sorted.count - 1)]
+    }
+
+    /// A single estimated 5-hour bar, or nil if there's no active block.
+    static func bars(allBlocks: [BlockStats], now: Date) -> [LimitBar] {
+        guard let active = allBlocks.last, now < active.end,
+              let last = active.stats.entries.last,
+              now.timeIntervalSince(last.timestamp) < 5 * 3600 else { return [] }
+        let cap = calibratedCap(blocks: allBlocks, activeTokens: active.stats.totalTokens)
+        let pct = min(100, Double(active.stats.totalTokens) / Double(max(cap, 1)) * 100)
+        return [LimitBar(kind: "five_hour", scopeName: nil, label: "5-hour limit (estimated)",
+                         shortLabel: "5h", percent: pct, resetsAt: active.end, source: .estimated)]
+    }
+}
+
 // MARK: - Usage snapshot
 
 struct SessionSummary {
@@ -1085,12 +1228,14 @@ struct Snapshot {
 enum UsageMath {
     /// Active 5-hour billing block (ccusage algorithm: block start = first entry's
     /// timestamp floored to the hour; a block ends 5h after start or after a 5h gap).
-    static func activeBlock(entries: [UsageEntry], now: Date) -> BlockStats? {
+    static func allBlocks(entries: [UsageEntry]) -> [BlockStats] {
+        var blocks: [BlockStats] = []
         var block: BlockStats? = nil
         for e in entries {
             if var b = block {
                 let gap = b.stats.entries.last.map { e.timestamp.timeIntervalSince($0.timestamp) > 5 * 3600 } ?? false
                 if e.timestamp >= b.end || gap {
+                    blocks.append(b)
                     block = BlockStats(start: floorToHour(e.timestamp), stats: Stats(entries: [e]))
                 } else {
                     b.stats.entries.append(e)
@@ -1100,7 +1245,12 @@ enum UsageMath {
                 block = BlockStats(start: floorToHour(e.timestamp), stats: Stats(entries: [e]))
             }
         }
-        guard let b = block, now < b.end,
+        if let b = block { blocks.append(b) }
+        return blocks
+    }
+
+    static func activeBlock(entries: [UsageEntry], now: Date) -> BlockStats? {
+        guard let b = allBlocks(entries: entries).last, now < b.end,
               let last = b.stats.entries.last,
               now.timeIntervalSince(last.timestamp) < 5 * 3600 else { return nil }
         return b
@@ -1206,9 +1356,40 @@ enum UsageMath {
         let all = reader.entries(since: weekStart)
         let dayStart = Calendar.current.startOfDay(for: now)
         let todayEntries = all.filter { $0.timestamp >= dayStart }
-        let limits = ClaudeAccount.shared.fetchLimits(force: forceLimits)
         let sessions = activeSessions(entries: all, now: now)
         let today = Stats(entries: todayEntries)
+
+        let blocks = allBlocks(entries: all)
+        let block: BlockStats? = {
+            guard let b = blocks.last, now < b.end,
+                  let last = b.stats.entries.last,
+                  now.timeIntervalSince(last.timestamp) < 5 * 3600 else { return nil }
+            return b
+        }()
+
+        // Limits, best source first: Claude Code's own statusline hand-off (local,
+        // no token, no endpoint), then the OAuth usage endpoint, then a local
+        // estimate — so the rings keep working even if the endpoint breaks.
+        var limits: LimitsSnapshot?
+        var limitsHint: String?
+        if let official = Statusline.read(now: now) {
+            limits = LimitsSnapshot(bars: official, fetchedAt: now, stale: false)
+            LimitTracker.shared.record(official, at: now)
+        } else {
+            let live = ClaudeAccount.shared.fetchLimits(force: forceLimits)
+            if let live, !live.bars.isEmpty {
+                limits = live
+            } else {
+                let est = LocalEstimate.bars(allBlocks: blocks, now: now)
+                if !est.isEmpty {
+                    limits = LimitsSnapshot(bars: est, fetchedAt: now, stale: false)
+                    LimitTracker.shared.record(est, at: now)
+                } else {
+                    limits = live   // nil/empty — keep the endpoint's status & hint
+                    limitsHint = ClaudeAccount.shared.status.hint
+                }
+            }
+        }
 
         var hourCosts = [Double](repeating: 0, count: 24)
         for e in todayEntries {
@@ -1218,8 +1399,8 @@ enum UsageMath {
 
         return Snapshot(
             limits: limits,
-            limitsHint: ClaudeAccount.shared.status.hint,
-            block: activeBlock(entries: all, now: now),
+            limitsHint: limitsHint,
+            block: block,
             today: today,
             week: Stats(entries: all),
             sessions: sessions,
@@ -1554,6 +1735,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         refresh()
     }
 
+    private static var claudeSettingsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
+    }
+
+    /// The shell command Claude Code should run as its status line.
+    private static var statuslineCommand: String {
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        return "'\(exe)' --statusline"
+    }
+
+    /// True when Claude Code's settings already point its status line at Halo.
+    static func statuslineConfigured() -> Bool {
+        guard let data = try? Data(contentsOf: claudeSettingsURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cmd = (root["statusLine"] as? [String: Any])?["command"] as? String else { return false }
+        return cmd.contains("--statusline") && cmd.contains(".app/Contents/MacOS/")
+    }
+
+    /// Points Claude Code's status line at `Halo --statusline` so it hands us its
+    /// official limits locally. Explicit opt-in, with confirmation and a backup.
+    @objc private func enableOfficialLimits() {
+        let url = Self.claudeSettingsURL
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            root = obj
+        }
+        let existing = (root["statusLine"] as? [String: Any])?["command"] as? String
+
+        if Self.statuslineConfigured() {
+            let a = NSAlert()
+            a.messageText = "Official limits are already on"
+            a.informativeText = "Claude Code is already handing its official usage limits to Halo. Nothing to change."
+            a.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true); a.runModal(); return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Use Claude Code's official limits?"
+        var body = "This adds a statusLine entry to ~/.claude/settings.json so Claude Code hands its official 5-hour and weekly limits to Halo — locally, with no network call and no token. It's the most reliable source.\n\nRestart your Claude Code sessions afterward for it to take effect."
+        if let existing, !existing.isEmpty {
+            body += "\n\n⚠️ You already have a custom status line:\n\(existing)\nIt will be replaced (a backup is saved to settings.json.bak)."
+        }
+        alert.informativeText = body
+        alert.addButton(withTitle: "Enable")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        if let data = try? Data(contentsOf: url) {
+            try? data.write(to: url.appendingPathExtension("bak"))
+        }
+        root["statusLine"] = ["type": "command", "command": Self.statuslineCommand, "padding": 0]
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
+            try? out.write(to: url, options: .atomic)
+        }
+        refresh()
+
+        let done = NSAlert()
+        done.messageText = "Official limits enabled"
+        done.informativeText = "Run a prompt in Claude Code (or restart its sessions) so it starts sending limits to Halo. The rings switch to “official” automatically."
+        done.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true); done.runModal()
+    }
+
     @objc private func toggleLaunchAtLogin() {
         do {
             if SMAppService.mainApp.status == .enabled {
@@ -1589,13 +1836,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setStatusTitle(bars)
             if !limits.stale { LimitNotifier.shared.check(bars, now: now) }
 
-            menu.addItem(header(limits.stale
-                ? "Plan usage limits  (as of \(timeHM(limits.fetchedAt)))"
-                : "Plan usage limits"))
-            menu.addItem(coloredInfo([
-                ("How much of each plan limit you've used — resets at the time shown",
-                 .secondaryLabelColor),
-            ], size: 11))
+            let source = bars.first?.source ?? .live
+            let headerText: String
+            switch source {
+            case .estimated: headerText = "Plan usage limits  (estimated)"
+            case .official, .live:
+                headerText = limits.stale
+                    ? "Plan usage limits  (as of \(timeHM(limits.fetchedAt)))"
+                    : "Plan usage limits"
+            }
+            menu.addItem(header(headerText))
+            let subtitle: String
+            switch source {
+            case .official: subtitle = "Official, straight from Claude Code — no account fetch"
+            case .live:     subtitle = "How much of each plan limit you've used — resets at the time shown"
+            case .estimated: subtitle = "Estimated from your local logs — live limits are unavailable"
+            }
+            menu.addItem(coloredInfo([(subtitle, .secondaryLabelColor)], size: 11))
             let rings = NSMenuItem()
             rings.view = RingGaugesView(bars)
             menu.addItem(rings)
@@ -1734,6 +1991,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         login.target = self
         login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
         menu.addItem(login)
+
+        let official = NSMenuItem(title: "Use Claude Code's official limits",
+                                  action: #selector(enableOfficialLimits), keyEquivalent: "")
+        official.target = self
+        official.state = Self.statuslineConfigured() ? .on : .off
+        official.toolTip = "Reads limits from Claude Code locally (no network, no token) — the most reliable source."
+        menu.addItem(official)
 
         if snap.limits != nil {
             let out = NSMenuItem(title: "Disconnect from Claude", action: #selector(disconnect), keyEquivalent: "")
@@ -1876,6 +2140,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         i.attributedTitle = str
         return i
     }
+}
+
+// `Halo --statusline`: Claude Code invokes this per prompt, piping session JSON
+// (with official rate_limits) on stdin. Capture and exit before any AppKit setup.
+if CommandLine.arguments.contains("--statusline") {
+    Statusline.capture()
+    exit(0)
 }
 
 let app = NSApplication.shared
