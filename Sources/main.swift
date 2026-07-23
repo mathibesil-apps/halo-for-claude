@@ -833,6 +833,18 @@ final class ClaudeAccount {
     /// nil = no readable Claude Code login; `status` then says why. On a transient
     /// failure the previous good limits are returned marked stale, so the menu bar
     /// keeps showing percentages instead of dropping to the local-log fallback.
+    /// True when a browser sign-in isn't needed: Halo's own grant or Claude Code's
+    /// login is present and either unexpired or refreshable. Local read, no network.
+    func hasUsableLogin() -> Bool {
+        if let own = loadOwnTokens(), own.expiresAt > Date() || !own.refreshToken.isEmpty {
+            return true
+        }
+        if case .ok(let cc) = loadCredentials(), cc.expiresAt > Date() || !cc.refreshToken.isEmpty {
+            return true
+        }
+        return false
+    }
+
     func fetchLimits(force: Bool = false) -> LimitsSnapshot? {
         let now = Date()
         // Resolve credentials before the rate-limit gate: it costs one Keychain
@@ -1051,6 +1063,26 @@ final class ClaudeAccount {
         }.resume()
         sem.wait()
         return (outData, outStatus, outHeaders)
+    }
+}
+
+// MARK: - Where the limit rings get their data
+
+/// How the user wants the plan-limit % sourced. Stored in UserDefaults so both
+/// the menu (AppDelegate) and the snapshot math (UsageMath) can read it.
+enum LimitsSource: String, CaseIterable {
+    case auto, local, token
+
+    static var current: LimitsSource {
+        LimitsSource(rawValue: UserDefaults.standard.string(forKey: "limitsSource") ?? "") ?? .auto
+    }
+
+    var label: String {
+        switch self {
+        case .auto:  return "Automatic (recommended)"
+        case .local: return "Local — no token, no network"
+        case .token: return "Anthropic account (token)"
+        }
     }
 }
 
@@ -1367,27 +1399,46 @@ enum UsageMath {
             return b
         }()
 
-        // Limits, best source first: Claude Code's own statusline hand-off (local,
-        // no token, no endpoint), then the OAuth usage endpoint, then a local
-        // estimate — so the rings keep working even if the endpoint breaks.
+        // Limit rings, per the user's chosen source (see LimitsSource):
+        //   • official  — Claude Code's statusline hand-off (local, no token)
+        //   • token     — the OAuth usage endpoint (exact, but unofficial)
+        //   • estimate  — from local logs (approximate, never breaks)
         var limits: LimitsSnapshot?
         var limitsHint: String?
-        if let official = Statusline.read(now: now) {
-            limits = LimitsSnapshot(bars: official, fetchedAt: now, stale: false)
-            LimitTracker.shared.record(official, at: now)
-        } else {
-            let live = ClaudeAccount.shared.fetchLimits(force: forceLimits)
-            if let live, !live.bars.isEmpty {
-                limits = live
-            } else {
-                let est = LocalEstimate.bars(allBlocks: blocks, now: now)
-                if !est.isEmpty {
-                    limits = LimitsSnapshot(bars: est, fetchedAt: now, stale: false)
-                    LimitTracker.shared.record(est, at: now)
-                } else {
-                    limits = live   // nil/empty — keep the endpoint's status & hint
-                    limitsHint = ClaudeAccount.shared.status.hint
-                }
+
+        func estimate() -> LimitsSnapshot? {
+            let est = LocalEstimate.bars(allBlocks: blocks, now: now)
+            guard !est.isEmpty else { return nil }
+            LimitTracker.shared.record(est, at: now)
+            return LimitsSnapshot(bars: est, fetchedAt: now, stale: false)
+        }
+
+        let official = Statusline.read(now: now).map { bars -> LimitsSnapshot in
+            LimitTracker.shared.record(bars, at: now)
+            return LimitsSnapshot(bars: bars, fetchedAt: now, stale: false)
+        }
+
+        switch LimitsSource.current {
+        case .local:
+            // Never read the token or hit the endpoint.
+            limits = official ?? estimate()
+            if limits == nil {
+                limitsHint = "Local mode: run Claude Code with official limits set up, or it'll estimate from local logs."
+            }
+        case .token:
+            // The endpoint is the source of truth here (5h + weekly + per-model).
+            // Don't fall back to the local estimate — it only knows the 5-hour
+            // window, so it would drop the weekly/per-model rings. Show the
+            // endpoint's bars (stale cache included), else a "fetching" hint.
+            limits = ClaudeAccount.shared.fetchLimits(force: forceLimits)
+            if limits == nil { limitsHint = ClaudeAccount.shared.status.hint }
+        case .auto:
+            if let official { limits = official }
+            else {
+                let live = ClaudeAccount.shared.fetchLimits(force: forceLimits)
+                if let live, !live.bars.isEmpty { limits = live }
+                else if let est = estimate() { limits = est }
+                else { limits = live; limitsHint = ClaudeAccount.shared.status.hint }
             }
         }
 
@@ -1613,6 +1664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installEditMenu()   // so ⌘X/⌘C/⌘V/⌘A work in dialog text fields
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         startLoadingAnimation()
         // A populated menu from the first frame, so the icon is clickable while
@@ -1621,8 +1673,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         statusItem.menu = loadingMenu()
         UNUserNotificationCenter.current().delegate = self
         if LimitNotifier.shared.enabled { LimitNotifier.shared.requestAuthorization() }
+
+        // First launch: let the user choose how limits are read BEFORE the first
+        // fetch, so picking "Local" never touches the token or the Keychain.
+        if UserDefaults.standard.bool(forKey: "didOnboardLimits") {
+            startPolling()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.showLimitsOnboarding()
+                self?.startPolling()
+            }
+        }
+    }
+
+    private func startPolling() {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    /// A minimal Edit menu. Without it, an LSUIElement app has no responder for
+    /// ⌘V, so pasting the auth code into the Connect field only works via
+    /// right-click. This wires the standard clipboard shortcuts to the first
+    /// responder (the focused text field).
+    private func installEditMenu() {
+        let main = NSMenu()
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        NSApp.mainMenu = main
+    }
+
+    private enum OnboardStep { case choose, connectOffer, localOffer, officialSetup, done }
+
+    /// One-time welcome that frames the token-vs-local choice up front instead of
+    /// burying it in a submenu. A small state machine so every "← Back"/"Cancel"
+    /// returns to the previous step rather than dead-ending. Runs before the first
+    /// fetch, so picking Local never touches the token. Sets `limitsSource`.
+    private func showLimitsOnboarding() {
+        UserDefaults.standard.set(true, forKey: "didOnboardLimits")
+        var step = OnboardStep.choose
+
+        while step != .done {
+            switch step {
+            case .choose:
+                let a = NSAlert()
+                a.messageText = "Welcome to Halo for Claude"
+                a.informativeText = """
+                Halo shows how much of each Claude Code plan limit you've used, \
+                right in your menu bar. How should it read your limits?
+
+                • Automatic — reads the Claude login already on your Mac and fetches \
+                your exact numbers. Works instantly. (Uses an endpoint that isn't a \
+                documented public API, so it could change.)
+
+                • Local — no token, no network. Nothing leaves your Mac: it estimates \
+                from your local logs, or reads Claude Code's official limits if you \
+                set that up.
+
+                You can change this anytime in the menu → Plan limits source.
+                """
+                a.addButton(withTitle: "Automatic (recommended)")
+                a.addButton(withTitle: "Local — no token")
+                a.addButton(withTitle: "What's the difference?")
+                NSApp.activate(ignoringOtherApps: true)
+                switch a.runModal() {
+                case .alertFirstButtonReturn:
+                    UserDefaults.standard.set(LimitsSource.auto.rawValue, forKey: "limitsSource")
+                    // Automatic needs a Claude login to fetch exact numbers; offer
+                    // to connect now if there isn't a usable one on this Mac.
+                    step = ClaudeAccount.shared.hasUsableLogin() ? .done : .connectOffer
+                case .alertSecondButtonReturn:
+                    UserDefaults.standard.set(LimitsSource.local.rawValue, forKey: "limitsSource")
+                    step = Self.statuslineConfigured() ? .done : .localOffer
+                default:
+                    explainLimitsSource()   // then loop back to the choice
+                }
+
+            case .connectOffer:
+                let a = NSAlert()
+                a.messageText = "Connect to Claude?"
+                a.informativeText = "Halo didn't find a usable Claude login on this Mac, so it can't fetch your exact plan limits yet. Connect now (opens your browser) to see them. You can also do this later from the menu."
+                a.addButton(withTitle: "Connect to Claude…")
+                a.addButton(withTitle: "Skip for now")
+                a.addButton(withTitle: "← Back")
+                NSApp.activate(ignoringOtherApps: true)
+                switch a.runModal() {
+                case .alertFirstButtonReturn:  signIn(); step = .done
+                case .alertSecondButtonReturn: step = .done
+                default:                       step = .choose  // back
+                }
+
+            case .localOffer:
+                let a = NSAlert()
+                a.messageText = "Want exact local numbers?"
+                a.informativeText = "Claude Code can hand its real limits to Halo locally — no token, no network. Otherwise Halo estimates from your local logs."
+                a.addButton(withTitle: "Set up official limits…")
+                a.addButton(withTitle: "Use estimate for now")
+                a.addButton(withTitle: "← Back")
+                NSApp.activate(ignoringOtherApps: true)
+                switch a.runModal() {
+                case .alertFirstButtonReturn:  step = .officialSetup
+                case .alertSecondButtonReturn: step = .done   // stays Local, estimate
+                default:                       step = .choose  // back
+                }
+
+            case .officialSetup:
+                switch runOfficialSetup(backButton: true) {
+                case .enabled, .dismissed: step = .done
+                case .back:                step = .localOffer
+                }
+
+            case .done:
+                break
+            }
+        }
     }
 
     /// Show banners even though a menu bar app technically counts as frontmost.
@@ -1641,6 +1810,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             titleMode = mode
             refresh()
         }
+    }
+
+    @objc private func setLimitsSource(_ sender: NSMenuItem) {
+        guard let mode = LimitsSource(rawValue: sender.representedObject as? String ?? "") else { return }
+        UserDefaults.standard.set(mode.rawValue, forKey: "limitsSource")
+        if mode == .local, !Self.statuslineConfigured() {
+            let a = NSAlert()
+            a.messageText = "Local mode is on"
+            a.informativeText = "Halo will estimate limits from your local logs — no token, no network. For exact local numbers, use “Set up official limits…” so Claude Code hands Halo its real limits."
+            a.addButton(withTitle: "Set up official limits…")
+            a.addButton(withTitle: "Use estimate for now")
+            NSApp.activate(ignoringOtherApps: true)
+            if a.runModal() == .alertFirstButtonReturn { enableOfficialLimits(); return }
+        }
+        refresh(forceLimits: true)
+    }
+
+    @objc private func explainLimitsSource() {
+        let alert = NSAlert()
+        alert.messageText = "Where the plan-limit rings come from"
+        alert.informativeText = """
+        Halo can source your usage % three ways:
+
+        • Automatic (recommended) — no setup. Prefers Claude Code's official \
+        limits if you've set them up, otherwise reads your Claude login to fetch \
+        live numbers, otherwise estimates from your local logs.
+
+        • Local — no token, no network — never reads your login or contacts \
+        Anthropic. Uses Claude Code's official limits (if set up) or an estimate \
+        from your local logs. The most private option, and it can't break if \
+        Anthropic changes anything.
+
+        • Anthropic account (token) — reads the login Claude Code keeps in your \
+        Keychain and asks Anthropic for the exact numbers (including usage from \
+        your other devices). Most accurate, but it uses an endpoint that isn't a \
+        documented public API, so it could change.
+
+        “Set up official limits” points Claude Code's status line at Halo so it \
+        hands over its real limits locally — exact numbers with no token. It edits \
+        ~/.claude/settings.json (a backup is saved first).
+        """
+        alert.addButton(withTitle: "Got it")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func setLimitStyle(_ sender: NSMenuItem) {
@@ -1755,7 +1968,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// Points Claude Code's status line at `Halo --statusline` so it hands us its
     /// official limits locally. Explicit opt-in, with confirmation and a backup.
-    @objc private func enableOfficialLimits() {
+    enum SetupOutcome { case enabled, dismissed, back }
+
+    @objc private func enableOfficialLimits() { _ = runOfficialSetup(backButton: false) }
+
+    /// Writes the statusLine entry (with confirmation + backup). Returns whether it
+    /// was enabled, dismissed, or the user asked to go back — so a wizard can chain
+    /// it with real navigation. `backButton` labels the second button "← Back".
+    private func runOfficialSetup(backButton: Bool) -> SetupOutcome {
         let url = Self.claudeSettingsURL
         var root: [String: Any] = [:]
         if let data = try? Data(contentsOf: url),
@@ -1769,20 +1989,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             a.messageText = "Official limits are already on"
             a.informativeText = "Claude Code is already handing its official usage limits to Halo. Nothing to change."
             a.addButton(withTitle: "OK")
-            NSApp.activate(ignoringOtherApps: true); a.runModal(); return
+            NSApp.activate(ignoringOtherApps: true); a.runModal(); return .enabled
         }
 
         let alert = NSAlert()
         alert.messageText = "Use Claude Code's official limits?"
-        var body = "This adds a statusLine entry to ~/.claude/settings.json so Claude Code hands its official 5-hour and weekly limits to Halo — locally, with no network call and no token. It's the most reliable source.\n\nRestart your Claude Code sessions afterward for it to take effect."
+        var body = "This adds a statusLine entry to ~/.claude/settings.json so Claude Code hands its official 5-hour and weekly limits to Halo — locally, no network, no token.\n\n⚠️ This is global: it applies to ALL your Claude Code sessions on this Mac, including work ones. It never touches your login — only the status line — but in a work session Halo would show that account's limits.\n\nRestart your Claude Code sessions afterward for it to take effect."
         if let existing, !existing.isEmpty {
-            body += "\n\n⚠️ You already have a custom status line:\n\(existing)\nIt will be replaced (a backup is saved to settings.json.bak)."
+            body += "\n\nYou already have a custom status line:\n\(existing)\nIt will be replaced (a backup is saved to settings.json.bak)."
         }
         alert.informativeText = body
         alert.addButton(withTitle: "Enable")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: backButton ? "← Back" : "Cancel")
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return backButton ? .back : .dismissed
+        }
 
         if let data = try? Data(contentsOf: url) {
             try? data.write(to: url.appendingPathExtension("bak"))
@@ -1799,6 +2021,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         done.informativeText = "Run a prompt in Claude Code (or restart its sessions) so it starts sending limits to Halo. The rings switch to “official” automatically."
         done.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true); done.runModal()
+        return .enabled
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -1992,12 +2215,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
         menu.addItem(login)
 
-        let official = NSMenuItem(title: "Use Claude Code's official limits",
-                                  action: #selector(enableOfficialLimits), keyEquivalent: "")
-        official.target = self
-        official.state = Self.statuslineConfigured() ? .on : .off
-        official.toolTip = "Reads limits from Claude Code locally (no network, no token) — the most reliable source."
-        menu.addItem(official)
+        let src = NSMenuItem(title: "Plan limits source", action: nil, keyEquivalent: "")
+        let ssub = NSMenu()
+        let srcHeader = NSMenuItem(title: "Where the % rings come from:", action: nil, keyEquivalent: "")
+        srcHeader.isEnabled = false
+        ssub.addItem(srcHeader)
+        for mode in LimitsSource.allCases {
+            let it = NSMenuItem(title: mode.label, action: #selector(setLimitsSource(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = mode.rawValue
+            it.state = (LimitsSource.current == mode) ? .on : .off
+            ssub.addItem(it)
+        }
+        ssub.addItem(.separator())
+        let setup = NSMenuItem(title: Self.statuslineConfigured() ? "Official limits: on ✓" : "Set up official limits…",
+                               action: #selector(enableOfficialLimits), keyEquivalent: "")
+        setup.target = self
+        setup.toolTip = "Points Claude Code's status line at Halo so it hands over its real limits locally — exact, and no token."
+        ssub.addItem(setup)
+        let explainItem = NSMenuItem(title: "What's the difference?", action: #selector(explainLimitsSource), keyEquivalent: "")
+        explainItem.target = self
+        ssub.addItem(explainItem)
+        src.submenu = ssub
+        menu.addItem(src)
 
         if snap.limits != nil {
             let out = NSMenuItem(title: "Disconnect from Claude", action: #selector(disconnect), keyEquivalent: "")
