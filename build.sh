@@ -7,7 +7,13 @@ APP="Halo for Claude.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -O -o "$APP/Contents/MacOS/Halo" Sources/main.swift
+# Universal binary: compile each arch, then lipo them so it runs on both Apple
+# Silicon and Intel Macs. macOS 13 is the floor (SMAppService "Launch at login").
+BIN_TMP=$(mktemp -d)
+swiftc -O -target arm64-apple-macos13.0  -o "$BIN_TMP/Halo-arm64"  Sources/main.swift
+swiftc -O -target x86_64-apple-macos13.0 -o "$BIN_TMP/Halo-x86_64" Sources/main.swift
+lipo -create "$BIN_TMP/Halo-arm64" "$BIN_TMP/Halo-x86_64" -o "$APP/Contents/MacOS/Halo"
+rm -rf "$BIN_TMP"
 
 # App icon: build AppIcon.icns from the 1024px source (sips + iconutil ship with macOS).
 if [ -f icon/AppIcon-1024.png ]; then
@@ -31,7 +37,8 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleName</key><string>Halo for Claude</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.03</string>
+    <key>CFBundleShortVersionString</key><string>0.04</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
