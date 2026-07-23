@@ -68,6 +68,22 @@ Either way it never asks for a password and never talks to anything except
 Anthropic. Not connected at all? Everything below the rings still works —
 token and cost stats come from your local logs.
 
+## Where the plan limits come from
+
+Halo resolves the ring percentages from the best source available, and labels
+which one it used:
+
+1. **Official (recommended)** — Claude Code itself can hand Halo its real 5-hour
+   and weekly limits, locally, with **no network call and no token**. Turn it on
+   from the menu: **Use Claude Code's official limits** (it adds a `statusLine`
+   entry to `~/.claude/settings.json`, with your consent and a backup). This is
+   the most reliable source and doesn't touch any Anthropic endpoint.
+2. **Live** — the account usage endpoint (accurate, but an undocumented API that
+   can change).
+3. **Estimated** — if neither is available, Halo estimates your 5-hour usage from
+   local logs against a self-calibrating cap, so the ring keeps working. The menu
+   marks these as *estimated*.
+
 ## What you get
 
 **Plan limits** — a ring per limit (5-hour session, weekly across all models,
