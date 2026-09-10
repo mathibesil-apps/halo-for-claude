@@ -1,17 +1,17 @@
 #!/bin/bash
-# Build "Halo for Claude.app" — Claude Code usage in your menu bar.
+# Build "Halo Usage.app" — Claude Code and Codex usage in your menu bar.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Halo for Claude.app"
+APP="Halo Usage.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Universal binary: compile each arch, then lipo them so it runs on both Apple
 # Silicon and Intel Macs. macOS 13 is the floor (SMAppService "Launch at login").
 BIN_TMP=$(mktemp -d)
-swiftc -O -target arm64-apple-macos13.0  -o "$BIN_TMP/Halo-arm64"  Sources/main.swift
-swiftc -O -target x86_64-apple-macos13.0 -o "$BIN_TMP/Halo-x86_64" Sources/main.swift
+swiftc -O -target arm64-apple-macos13.0  -o "$BIN_TMP/Halo-arm64"  Sources/*.swift
+swiftc -O -target x86_64-apple-macos13.0 -o "$BIN_TMP/Halo-x86_64" Sources/*.swift
 lipo -create "$BIN_TMP/Halo-arm64" "$BIN_TMP/Halo-x86_64" -o "$APP/Contents/MacOS/Halo"
 rm -rf "$BIN_TMP"
 
@@ -34,10 +34,10 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <dict>
     <key>CFBundleExecutable</key><string>Halo</string>
     <key>CFBundleIdentifier</key><string>com.mathiasbesil.halo</string>
-    <key>CFBundleName</key><string>Halo for Claude</string>
+    <key>CFBundleName</key><string>Halo Usage</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.06</string>
+    <key>CFBundleShortVersionString</key><string>0.07</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
 </dict>
@@ -54,7 +54,7 @@ if [ -z "${CODESIGN_ID:-}" ]; then
         | tr -d '"' || true)
 fi
 if [ -n "${CODESIGN_ID:-}" ] && [ "$CODESIGN_ID" != "-" ]; then
-    codesign --force --sign "$CODESIGN_ID" "$APP"
+    codesign --force --timestamp --sign "$CODESIGN_ID" "$APP"
     echo "Built $APP  (signed: $CODESIGN_ID)"
 else
     codesign --force --sign - "$APP"
