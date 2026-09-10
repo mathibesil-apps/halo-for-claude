@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build, sign (hardened runtime), package, and notarize "Halo for Claude"
+# Build, sign (hardened runtime), package, and notarize "Halo Usage"
 # into a distributable .dmg. Run this to cut a release people can download and
 # open with a double-click — no Gatekeeper warnings.
 #
@@ -12,9 +12,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Halo for Claude.app"
-DMG="Halo-for-Claude.dmg"
-VOLNAME="Halo for Claude"
+APP="Halo Usage.app"
+DMG="Halo-Usage.dmg"
+VOLNAME="Halo Usage"
 NOTARY_PROFILE="${NOTARY_PROFILE:-halo-notary}"
 
 # --- 1. Find the Developer ID Application certificate ------------------------

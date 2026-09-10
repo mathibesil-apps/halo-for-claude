@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import Foundation
 import ServiceManagement
+import SwiftUI
 import UserNotifications
 
 // MARK: - Demo mode
@@ -32,6 +33,33 @@ enum Demo {
     }
 }
 
+// MARK: - Service selection
+
+/// Which coding agent Halo is currently monitoring. Kept as a single global
+/// choice so the menu bar, local-log reader, account client, and notifications
+/// always describe the same account.
+enum UsageProvider: String, CaseIterable {
+    case claude, codex
+
+    static var current: UsageProvider {
+        UsageProvider(rawValue: UserDefaults.standard.string(forKey: "usageProvider") ?? "") ?? .claude
+    }
+
+    var label: String {
+        switch self {
+        case .claude: return "Claude Code"
+        case .codex: return "Codex"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+}
+
 // MARK: - Data model
 
 struct UsageEntry {
@@ -48,10 +76,40 @@ struct UsageEntry {
     let cwd: String
     /// Subagent turns; they bill normally but their context is not the main thread's.
     let isSidechain: Bool
+    /// Claude and Codex report cached input differently. This lets the shared
+    /// stats/UI use the right total without double-counting Codex cached tokens.
+    let provider: UsageProvider
 
-    var totalTokens: Int { inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens }
+    init(timestamp: Date, model: String, inputTokens: Int, outputTokens: Int,
+         cacheCreationTokens: Int, cacheReadTokens: Int, dedupeKey: String,
+         sessionId: String, cwd: String, isSidechain: Bool,
+         provider: UsageProvider = .claude) {
+        self.timestamp = timestamp
+        self.model = model
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheCreationTokens = cacheCreationTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.dedupeKey = dedupeKey
+        self.sessionId = sessionId
+        self.cwd = cwd
+        self.isSidechain = isSidechain
+        self.provider = provider
+    }
+
+    var totalTokens: Int {
+        switch provider {
+        case .claude: return inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
+        case .codex: return inputTokens + outputTokens
+        }
+    }
     /// Approximate context size of this turn: everything the model was sent.
-    var contextTokens: Int { inputTokens + cacheCreationTokens + cacheReadTokens }
+    var contextTokens: Int {
+        switch provider {
+        case .claude: return inputTokens + cacheCreationTokens + cacheReadTokens
+        case .codex: return inputTokens
+        }
+    }
     var project: String {
         let name = (cwd as NSString).lastPathComponent
         return Demo.project(name.isEmpty ? "unknown" : name)
@@ -76,7 +134,9 @@ struct Stats {
             let cur = agg[name] ?? (0, 0)
             agg[name] = (cur.0 + e.totalTokens, cur.1 + Pricing.cost(for: e))
         }
-        return agg.map { ($0.key, $0.value.0, $0.value.1) }.sorted { $0.2 > $1.2 }
+        return agg.map { ($0.key, $0.value.0, $0.value.1) }.sorted {
+            $0.2 == $1.2 ? $0.1 > $1.1 : $0.2 > $1.2
+        }
     }
 }
 
@@ -105,13 +165,16 @@ enum Pricing {
 
     static func shortName(_ model: String) -> String {
         let m = model.lowercased()
-        for name in ["fable", "opus", "sonnet", "haiku"] where m.contains(name) {
+        for name in ["astra", "sol", "terra", "luna", "spark", "fable", "opus", "sonnet", "haiku"] where m.contains(name) {
             return name.capitalized
         }
         return model.isEmpty ? "unknown" : model
     }
 
     static func cost(for e: UsageEntry) -> Double {
+        // ChatGPT-plan Codex consumption is governed by rate-limit percentages
+        // and credits, not by the Anthropic API list-price approximation below.
+        guard e.provider == .claude else { return 0 }
         let r = rate(for: e.model)
         return (Double(e.inputTokens) * r.input
               + Double(e.outputTokens) * r.output
@@ -234,6 +297,142 @@ final class UsageReader {
     }
 }
 
+// MARK: - Codex JSONL parsing
+
+/// Reads Codex's local rollout files. Each `token_count` event contains the
+/// usage of the last model request as well as a cumulative total; using
+/// `last_token_usage` means tool loops count correctly without repeatedly
+/// adding the cumulative value. Cached input is a subset of Codex input, so it
+/// is exposed for the breakdown but not added again to `totalTokens`.
+final class CodexUsageReader {
+    private let roots: [URL] = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        return [home.appendingPathComponent("sessions"),
+                home.appendingPathComponent("archived_sessions")]
+    }()
+
+    private struct CachedFile {
+        let mtime: Date
+        let size: Int
+        let entries: [UsageEntry]
+    }
+    private var cache: [String: CachedFile] = [:]
+
+    private let isoParser: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private let isoParserNoFrac = ISO8601DateFormatter()
+
+    private func parseDate(_ s: String) -> Date? {
+        isoParser.date(from: s) ?? isoParserNoFrac.date(from: s)
+    }
+
+    func entries(since cutoff: Date) -> [UsageEntry] {
+        var result: [UsageEntry] = []
+        var liveFiles = Set<String>()
+
+        for root in roots {
+            guard let en = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
+
+            for case let url as URL in en {
+                guard url.pathExtension == "jsonl" else { continue }
+                guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                      let mtime = vals.contentModificationDate else { continue }
+                if mtime < cutoff { continue }
+
+                let path = url.path
+                let size = vals.fileSize ?? 0
+                liveFiles.insert(path)
+                let fileEntries: [UsageEntry]
+                if let cached = cache[path], cached.mtime == mtime, cached.size == size {
+                    fileEntries = cached.entries
+                } else {
+                    fileEntries = parseFile(url)
+                    cache[path] = CachedFile(mtime: mtime, size: size, entries: fileEntries)
+                }
+                result.append(contentsOf: fileEntries.filter { $0.timestamp >= cutoff })
+            }
+        }
+
+        for key in cache.keys where !liveFiles.contains(key) { cache.removeValue(forKey: key) }
+
+        var seen = Set<String>()
+        return result.sorted {
+            $0.timestamp == $1.timestamp ? $0.dedupeKey < $1.dedupeKey : $0.timestamp < $1.timestamp
+        }.filter { $0.dedupeKey.isEmpty || seen.insert($0.dedupeKey).inserted }
+    }
+
+    private func parseFile(_ url: URL) -> [UsageEntry] {
+        guard let data = FileManager.default.contents(atPath: url.path),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+
+        var sessionId = url.deletingPathExtension().lastPathComponent
+        var cwd = ""
+        var model = ""
+        var sidechain = false
+        var out: [UsageEntry] = []
+
+        for line in text.split(separator: "\n") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let type = obj["type"] as? String,
+                  let payload = obj["payload"] as? [String: Any] else { continue }
+
+            switch type {
+            case "session_meta":
+                sessionId = (payload["id"] as? String)
+                    ?? (payload["session_id"] as? String)
+                    ?? sessionId
+                cwd = (payload["cwd"] as? String) ?? cwd
+                // Root sessions use a string source (cli/vscode); subagents use
+                // a tagged object such as {subagent:{...}}.
+                sidechain = payload["source"] is [String: Any]
+
+            case "turn_context":
+                model = (payload["model"] as? String) ?? model
+                cwd = (payload["cwd"] as? String) ?? cwd
+
+            case "event_msg":
+                guard payload["type"] as? String == "token_count",
+                      let info = payload["info"] as? [String: Any],
+                      let usage = info["last_token_usage"] as? [String: Any],
+                      let tsString = obj["timestamp"] as? String,
+                      let timestamp = parseDate(tsString) else { continue }
+
+                let input = usage["input_tokens"] as? Int ?? 0
+                let output = usage["output_tokens"] as? Int ?? 0
+                let cached = usage["cached_input_tokens"] as? Int ?? 0
+                let cacheWrite = usage["cache_write_input_tokens"] as? Int ?? 0
+                guard input > 0 || output > 0 else { continue }
+
+                let ordinal = (obj["ordinal"] as? Int).map(String.init)
+                    ?? ((info["total_token_usage"] as? [String: Any])?["total_tokens"] as? Int).map(String.init)
+                    ?? tsString
+                out.append(UsageEntry(
+                    timestamp: timestamp,
+                    model: model,
+                    inputTokens: input,
+                    outputTokens: output,
+                    cacheCreationTokens: cacheWrite,
+                    cacheReadTokens: cached,
+                    dedupeKey: "\(sessionId):\(ordinal)",
+                    sessionId: sessionId,
+                    cwd: cwd,
+                    isSidechain: sidechain,
+                    provider: .codex
+                ))
+
+            default:
+                continue
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - Claude account OAuth (own token, stored in this app's Keychain item)
 
 /// Where a limit percentage came from, best-to-worst. Shown in the UI so an
@@ -252,17 +451,41 @@ struct LimitBar {
     let percent: Double        // 0–100
     let resetsAt: Date?
     var source: LimitSource = .live
+    var provider: UsageProvider = .claude
 
     /// Persistence key for history tracking; stable across label wording changes.
-    var trackerKey: String { scopeName.map { "\(kind):\($0)" } ?? kind }
+    var trackerKey: String {
+        let local = scopeName.map { "\(kind):\($0)" } ?? kind
+        return "\(provider.rawValue):\(local)"
+    }
 
     /// Short name under a ring gauge.
     var displayName: String {
+        if provider == .codex {
+            let window: String = {
+                if label.hasPrefix("5-hour") { return "5h" }
+                if label.hasPrefix("Weekly") { return "Wk" }
+                if let dot = label.range(of: " · ") { return String(label[..<dot.lowerBound]) }
+                return label.replacingOccurrences(of: " limit", with: "")
+            }()
+            if let scopeName {
+                let parsed = Pricing.shortName(scopeName)
+                let model = parsed != scopeName ? parsed
+                    : (scopeName.lowercased().contains("reserve") ? "Reserve" : scopeName)
+                return "\(model) \(window)"
+            }
+            return window
+        }
         switch kind {
         case "session", "five_hour": return "5-hour"
         case "weekly_all", "seven_day": return "Weekly"
         default:
-            if let scopeName { return scopeName }
+            if let scopeName {
+                let short = Pricing.shortName(scopeName)
+                if short != scopeName { return short }
+                if scopeName.lowercased().contains("reserve") { return "Reserve" }
+                return scopeName
+            }
             if let dot = label.range(of: " · ") { return String(label[dot.upperBound...]) }
             return label
         }
@@ -297,9 +520,13 @@ final class LimitTracker {
 
     func record(_ bars: [LimitBar], at now: Date) {
         queue.sync {
-            // Drop series for limits the API no longer reports.
+            // Drop series for limits this provider no longer reports, while
+            // retaining the other provider's history across service switches.
             let liveKeys = Set(bars.map { $0.trackerKey })
-            series = series.filter { liveKeys.contains($0.key) }
+            let providerPrefixes = Set(bars.map { $0.provider.rawValue + ":" })
+            series = series.filter { key, _ in
+                !providerPrefixes.contains(where: { key.hasPrefix($0) }) || liveKeys.contains(key)
+            }
             for bar in bars {
                 var s = series[bar.trackerKey] ?? []
                 // A drop in percent means the window reset; old samples are useless.
@@ -389,7 +616,8 @@ final class LimitNotifier {
     /// How early to flag unused capacity: the 5-hour window is short enough that
     /// half an hour is still usable; a weekly window deserves more warning.
     private func headroomLead(_ bar: LimitBar) -> TimeInterval {
-        (bar.kind == "session" || bar.kind == "five_hour") ? 30 * 60 : 60 * 60
+        (bar.kind == "session" || bar.kind == "five_hour" || bar.label.hasPrefix("5-hour"))
+            ? 30 * 60 : 60 * 60
     }
 
     /// Call with fresh (non-stale) bars only; stale bars repeat old percentages.
@@ -1066,6 +1294,321 @@ final class ClaudeAccount {
     }
 }
 
+// MARK: - Codex account usage via the official app-server protocol
+
+struct CodexDailyUsage {
+    let startDate: String
+    let tokens: Int
+}
+
+struct CodexAccountUsage {
+    var lifetimeTokens: Int?
+    var peakDailyTokens: Int?
+    var longestRunningTurnSec: Int?
+    var currentStreakDays: Int?
+    var longestStreakDays: Int?
+    var daily: [CodexDailyUsage] = []
+    var planType: String?
+    var creditBalance: String?
+}
+
+struct CodexAccountSnapshot {
+    var limits: LimitsSnapshot?
+    var usage: CodexAccountUsage?
+    var hint: String?
+}
+
+/// Starts Codex's documented JSON-RPC app server over stdio and asks it for
+/// account rate limits and token activity. Codex owns and refreshes its login;
+/// Halo never reads `~/.codex/auth.json` or handles a ChatGPT access token.
+final class CodexAccount {
+    static let shared = CodexAccount()
+
+    private var cachedLimits: LimitsSnapshot?
+    private var cachedUsage: CodexAccountUsage?
+    private var nextPoll = Date.distantPast
+    private let pollInterval: TimeInterval = 120
+
+    private init() {}
+
+    func fetch(force: Bool = false) -> CodexAccountSnapshot {
+        let now = Date()
+        if !force, now < nextPoll, cachedLimits != nil || cachedUsage != nil {
+            return CodexAccountSnapshot(limits: cachedLimits, usage: cachedUsage, hint: nil)
+        }
+        nextPoll = now.addingTimeInterval(pollInterval)
+
+        guard let executable = Self.codexExecutable() else {
+            return CodexAccountSnapshot(
+                limits: cachedLimits?.markedStale(), usage: cachedUsage,
+                hint: "Codex CLI not found — install or open Codex, then refresh")
+        }
+
+        switch Self.run(executable: executable) {
+        case .failure(let message):
+            NSLog("Codex usage fetch failed: \(message)")
+            return CodexAccountSnapshot(
+                limits: cachedLimits?.markedStale(), usage: cachedUsage,
+                hint: cachedLimits == nil ? "Codex usage unavailable — sign in to Codex and try again" : nil)
+
+        case .success(let responses):
+            var freshLimits: LimitsSnapshot?
+            var freshUsage = cachedUsage
+
+            if let rateResult = responses[1]?["result"] as? [String: Any] {
+                let bars = Self.parseRateLimits(rateResult)
+                if !bars.isEmpty {
+                    freshLimits = LimitsSnapshot(bars: bars, fetchedAt: now, stale: false)
+                    cachedLimits = freshLimits
+                    LimitTracker.shared.record(bars, at: now)
+                }
+            }
+            if let usageResult = responses[2]?["result"] as? [String: Any] {
+                var usage = Self.parseUsage(usageResult)
+                Self.addAccountDetails(from: responses[1]?["result"] as? [String: Any], to: &usage)
+                freshUsage = usage
+                cachedUsage = usage
+            } else if var usage = freshUsage {
+                Self.addAccountDetails(from: responses[1]?["result"] as? [String: Any], to: &usage)
+                freshUsage = usage
+                cachedUsage = usage
+            }
+
+            let limits = freshLimits ?? cachedLimits?.markedStale()
+            let hasError = responses[1]?["error"] != nil || responses[2]?["error"] != nil
+            let hint = (limits == nil && hasError)
+                ? "Codex account usage unavailable — check that Codex is signed in with ChatGPT"
+                : nil
+            return CodexAccountSnapshot(limits: limits, usage: freshUsage, hint: hint)
+        }
+    }
+
+    private static func codexExecutable() -> URL? {
+        var candidates: [String] = []
+        if let explicit = ProcessInfo.processInfo.environment["CODEX_CLI_PATH"], !explicit.isEmpty {
+            candidates.append(explicit)
+        }
+        candidates.append(contentsOf: [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/usr/local/bin/codex",
+            "/opt/homebrew/bin/codex",
+        ])
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map { "\($0)/codex" })
+        }
+        return candidates.lazy
+            .map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    /// Responses are keyed by their JSON-RPC id. Notifications and diagnostics
+    /// are ignored, and stderr is discarded so a model-catalog warning cannot
+    /// fill a pipe and stall the account requests.
+    private static func run(executable: URL) -> Result<[Int: [String: Any]], Error> {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["app-server"]
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do { try process.run() }
+        catch { return .failure(error) }
+
+        let messages: [[String: Any]] = [
+            ["method": "initialize", "id": 0, "params": [
+                "clientInfo": ["name": "halo_usage", "title": "Halo Usage", "version": "0.1.0"]]],
+            ["method": "initialized", "params": [:]],
+            ["method": "account/rateLimits/read", "id": 1, "params": [:]],
+            ["method": "account/usage/read", "id": 2, "params": [:]],
+        ]
+        let stateQueue = DispatchQueue(label: "com.mathiasbesil.halo.codex-response")
+        let completed = DispatchSemaphore(value: 0)
+        var buffer = Data()
+        var responses: [Int: [String: Any]] = [:]
+        var didSignal = false
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            stateQueue.sync {
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    let line = buffer[..<newline]
+                    buffer.removeSubrange(...newline)
+                    guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                          let id = obj["id"] as? Int else { continue }
+                    responses[id] = obj
+                }
+                if responses[1] != nil, responses[2] != nil, !didSignal {
+                    didSignal = true
+                    completed.signal()
+                }
+            }
+        }
+
+        for message in messages {
+            guard let data = try? JSONSerialization.data(withJSONObject: message) else { continue }
+            input.fileHandleForWriting.write(data)
+            input.fileHandleForWriting.write(Data([0x0A]))
+        }
+        _ = completed.wait(timeout: .now() + 15)
+        try? input.fileHandleForWriting.close()
+        if process.isRunning { process.terminate() }
+        process.waitUntilExit()
+        output.fileHandleForReading.readabilityHandler = nil
+        let finalResponses = stateQueue.sync { responses }
+        guard finalResponses[1] != nil || finalResponses[2] != nil else {
+            return .failure(CodexAccountError.invalidResponse)
+        }
+        return .success(finalResponses)
+    }
+
+    private enum CodexAccountError: LocalizedError {
+        case invalidResponse
+        var errorDescription: String? { "app-server returned no account response" }
+    }
+
+    private static func int(_ raw: Any?) -> Int? {
+        if let value = raw as? Int { return value }
+        if let number = raw as? NSNumber { return number.intValue }
+        return nil
+    }
+
+    private static func double(_ raw: Any?) -> Double? {
+        if let value = raw as? Double { return value }
+        if let number = raw as? NSNumber { return number.doubleValue }
+        return nil
+    }
+
+    private static func parseRateLimits(_ result: [String: Any]) -> [LimitBar] {
+        var buckets: [(String, [String: Any])] = []
+        if let byId = result["rateLimitsByLimitId"] as? [String: Any] {
+            for (id, raw) in byId {
+                if let bucket = raw as? [String: Any] { buckets.append((id, bucket)) }
+            }
+        } else if let bucket = result["rateLimits"] as? [String: Any] {
+            buckets.append(((bucket["limitId"] as? String) ?? "codex", bucket))
+        }
+
+        struct WindowBar {
+            let bar: LimitBar
+            let general: Bool
+            let minutes: Int
+            let scope: String
+        }
+        var parsed: [WindowBar] = []
+        for (fallbackId, bucket) in buckets {
+            let limitId = (bucket["limitId"] as? String) ?? fallbackId
+            let rawName = bucket["limitName"] as? String
+            let scope = Self.scopeName(limitId: limitId, limitName: rawName)
+            for slot in ["primary", "secondary"] {
+                guard let window = bucket[slot] as? [String: Any],
+                      let percent = double(window["usedPercent"]), percent.isFinite,
+                      let minutes = int(window["windowDurationMins"]) else { continue }
+
+                let windowLabel = Self.windowLabel(minutes)
+                let windowShort = Self.windowShortLabel(minutes)
+                let label = scope.map { "\(windowLabel) · \($0)" } ?? "\(windowLabel) limit"
+                let short: String
+                if let scope {
+                    let model = Pricing.shortName(scope)
+                    let compact = model == scope ? Self.abbreviation(scope) : model
+                    short = "\(compact) \(windowShort)"
+                } else {
+                    short = windowShort
+                }
+                let reset = double(window["resetsAt"]).map { Date(timeIntervalSince1970: $0) }
+                let bar = LimitBar(
+                    kind: "codex.\(limitId).\(slot).\(minutes)",
+                    scopeName: scope,
+                    label: label,
+                    shortLabel: short,
+                    percent: min(max(percent, 0), 100),
+                    resetsAt: reset,
+                    source: .official,
+                    provider: .codex)
+                parsed.append(WindowBar(bar: bar, general: scope == nil,
+                                        minutes: minutes, scope: scope ?? ""))
+            }
+        }
+        return parsed.sorted {
+            if $0.general != $1.general { return $0.general && !$1.general }
+            if $0.scope != $1.scope { return $0.scope.localizedCaseInsensitiveCompare($1.scope) == .orderedAscending }
+            return $0.minutes < $1.minutes
+        }.map(\.bar)
+    }
+
+    /// Null names on the main `codex` bucket mean the account-wide limit. Other
+    /// buckets retain the server's display name so new model families appear
+    /// automatically without an app update.
+    private static func scopeName(limitId: String, limitName: String?) -> String? {
+        if let name = limitName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            return name
+        }
+        if limitId == "codex" { return nil }
+        return limitId.replacingOccurrences(of: "codex_", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
+    }
+
+    private static func abbreviation(_ name: String) -> String {
+        if name.lowercased().contains("reserve") { return "Res" }
+        let words = name.split { !$0.isLetter && !$0.isNumber }
+        if let last = words.last, last.count >= 2 { return String(last.prefix(3)).capitalized }
+        return String(name.prefix(3)).capitalized
+    }
+
+    private static func windowLabel(_ minutes: Int) -> String {
+        switch minutes {
+        case 300: return "5-hour"
+        case 10_080: return "Weekly"
+        case let m where m % 1_440 == 0: return "\(m / 1_440)-day"
+        case let m where m % 60 == 0: return "\(m / 60)-hour"
+        default: return "\(minutes)-minute"
+        }
+    }
+
+    private static func windowShortLabel(_ minutes: Int) -> String {
+        switch minutes {
+        case 300: return "5h"
+        case 10_080: return "Wk"
+        case let m where m % 1_440 == 0: return "\(m / 1_440)d"
+        case let m where m % 60 == 0: return "\(m / 60)h"
+        default: return "\(minutes)m"
+        }
+    }
+
+    private static func parseUsage(_ result: [String: Any]) -> CodexAccountUsage {
+        let summary = result["summary"] as? [String: Any]
+        var daily: [CodexDailyUsage] = []
+        if let buckets = result["dailyUsageBuckets"] as? [[String: Any]] {
+            for bucket in buckets {
+                if let date = bucket["startDate"] as? String, let tokens = int(bucket["tokens"]) {
+                    daily.append(CodexDailyUsage(startDate: date, tokens: tokens))
+                }
+            }
+        }
+        return CodexAccountUsage(
+            lifetimeTokens: int(summary?["lifetimeTokens"]),
+            peakDailyTokens: int(summary?["peakDailyTokens"]),
+            longestRunningTurnSec: int(summary?["longestRunningTurnSec"]),
+            currentStreakDays: int(summary?["currentStreakDays"]),
+            longestStreakDays: int(summary?["longestStreakDays"]),
+            daily: daily)
+    }
+
+    private static func addAccountDetails(from result: [String: Any]?, to usage: inout CodexAccountUsage) {
+        guard let result else { return }
+        let main = (result["rateLimits"] as? [String: Any])
+            ?? ((result["rateLimitsByLimitId"] as? [String: Any])?["codex"] as? [String: Any])
+        usage.planType = main?["planType"] as? String
+        usage.creditBalance = (main?["credits"] as? [String: Any])?["balance"] as? String
+    }
+}
+
 // MARK: - Where the limit rings get their data
 
 /// How the user wants the plan-limit % sourced. Stored in UserDefaults so both
@@ -1223,10 +1766,12 @@ enum LocalEstimate {
 // MARK: - Usage snapshot
 
 struct SessionSummary {
+    let id: String
     let project: String
     let model: String          // short name of the latest turn's model
     let contextTokens: Int     // latest turn's prompt size — resent every message
     let costToday: Double
+    let tokensToday: Int
 }
 
 /// One advisory line for the Insights section.
@@ -1234,6 +1779,10 @@ struct Insight {
     enum Severity { case info, warn, alert }
     let severity: Severity
     let text: String
+
+    /// A content-derived identifier remains stable while the same advisory is
+    /// displayed, while a changed recommendation is correctly a new row.
+    var id: String { "\(String(describing: severity)):\(text)" }
 
     /// Context sizes worth flagging — the whole context is re-sent every turn.
     static func contextSeverity(_ tokens: Int) -> Severity? {
@@ -1255,6 +1804,9 @@ struct Snapshot {
     var sessions: [SessionSummary] = []
     var insights: [Insight] = []
     var hourCosts: [Double] = []   // today's cost per hour, index 0 = midnight
+    var provider: UsageProvider = .claude
+    var codexAccountUsage: CodexAccountUsage?
+    var hourValuesAreTokens = false
 }
 
 enum UsageMath {
@@ -1296,30 +1848,36 @@ enum UsageMath {
             var last: UsageEntry
             var lastMain: UsageEntry?  // latest non-sidechain turn
             var costToday: Double
+            var tokensToday: Int
         }
         var bySession: [String: Acc] = [:]
         for e in entries where !e.sessionId.isEmpty {
             let cost = e.timestamp >= dayStart ? Pricing.cost(for: e) : 0
+            let tokens = e.timestamp >= dayStart ? e.totalTokens : 0
             if var a = bySession[e.sessionId] {
                 a.last = e
                 if !e.isSidechain { a.lastMain = e }
                 a.costToday += cost
+                a.tokensToday += tokens
                 bySession[e.sessionId] = a
             } else {
-                bySession[e.sessionId] = Acc(last: e, lastMain: e.isSidechain ? nil : e, costToday: cost)
+                bySession[e.sessionId] = Acc(last: e, lastMain: e.isSidechain ? nil : e,
+                                              costToday: cost, tokensToday: tokens)
             }
         }
         var out: [SessionSummary] = []
-        for (_, a) in bySession {
+        for (sessionId, a) in bySession {
             guard now.timeIntervalSince(a.last.timestamp) < 30 * 60 else { continue }
             // Context = the main thread's latest turn; subagent turns are smaller
             // side contexts and would understate it.
             let mainLast = a.lastMain ?? a.last
             out.append(SessionSummary(
+                id: sessionId,
                 project: a.last.project,
                 model: Pricing.shortName(mainLast.model),
                 contextTokens: mainLast.contextTokens,
-                costToday: a.costToday
+                costToday: a.costToday,
+                tokensToday: a.tokensToday
             ))
         }
         return Array(out.sorted { $0.contextTokens > $1.contextTokens }.prefix(5))
@@ -1461,6 +2019,48 @@ enum UsageMath {
         )
     }
 
+    /// Codex shares the presentation and local activity math with Claude, but
+    /// its authoritative rings and account totals come from `codex app-server`.
+    static func codexSnapshot(reader: CodexUsageReader, now: Date,
+                              forceLimits: Bool = false) -> Snapshot {
+        let weekStart = now.addingTimeInterval(-7 * 24 * 3600)
+        let all = reader.entries(since: weekStart)
+        let dayStart = Calendar.current.startOfDay(for: now)
+        let todayEntries = all.filter { $0.timestamp >= dayStart }
+        let sessions = activeSessions(entries: all, now: now)
+        let today = Stats(entries: todayEntries)
+        let blocks = allBlocks(entries: all)
+        let block: BlockStats? = {
+            guard let b = blocks.last, now < b.end,
+                  let last = b.stats.entries.last,
+                  now.timeIntervalSince(last.timestamp) < 5 * 3600 else { return nil }
+            return b
+        }()
+
+        let account = CodexAccount.shared.fetch(force: forceLimits)
+        var hourlyTokens = [Double](repeating: 0, count: 24)
+        for entry in todayEntries {
+            let hour = Calendar.current.component(.hour, from: entry.timestamp)
+            hourlyTokens[hour] += Double(entry.totalTokens)
+        }
+
+        return Snapshot(
+            limits: account.limits,
+            limitsHint: account.hint,
+            block: block,
+            today: today,
+            week: Stats(entries: all),
+            sessions: sessions,
+            insights: insights(sessions: sessions, today: today,
+                               limits: account.limits?.bars ?? [],
+                               todayEntries: todayEntries, now: now),
+            hourCosts: hourlyTokens,
+            provider: .codex,
+            codexAccountUsage: account.usage,
+            hourValuesAreTokens: true
+        )
+    }
+
     static func floorToHour(_ d: Date) -> Date {
         Date(timeIntervalSince1970: (d.timeIntervalSince1970 / 3600).rounded(.down) * 3600)
     }
@@ -1488,6 +2088,13 @@ let weekdayHMFormatter: DateFormatter = {
 
 func timeHM(_ d: Date) -> String { hmFormatter.string(from: d) }
 
+func formatDuration(_ seconds: Int) -> String {
+    let hours = seconds / 3600
+    let minutes = (seconds % 3600) / 60
+    if hours > 0 { return "\(hours)h \(minutes)m" }
+    return "\(minutes)m"
+}
+
 // MARK: - Limit gauge views
 
 /// Green / orange / red by how close a percentage is to its limit.
@@ -1501,7 +2108,7 @@ func limitColor(_ percent: Double) -> NSColor {
 
 func shortResetText(_ d: Date) -> String {
     let interval = d.timeIntervalSinceNow
-    if interval <= 0 { return "resets soon" }
+    if interval <= 0 { return "soon" }
     if interval < 24 * 3600 {
         let h = Int(interval) / 3600, m = (Int(interval) % 3600) / 60
         return h > 0 ? "in \(h)h \(m)m" : "in \(m)m"
@@ -1531,102 +2138,18 @@ func strokeRing(center: NSPoint, radius: CGFloat, lineWidth: CGFloat, percent: D
     }
 }
 
-/// A row of circular progress gauges, one per limit.
-final class RingGaugesView: NSView {
-    private let bars: [LimitBar]
-    private let cellWidth: CGFloat = 90
-
-    init(_ bars: [LimitBar]) {
-        self.bars = bars
-        super.init(frame: NSRect(x: 0, y: 0,
-                                 width: max(280, CGFloat(bars.count) * 90),
-                                 height: 96))
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let totalWidth = CGFloat(bars.count) * cellWidth
-        var x = (bounds.width - totalWidth) / 2
-        for bar in bars {
-            drawGauge(bar, in: NSRect(x: x, y: 0, width: cellWidth, height: bounds.height))
-            x += cellWidth
-        }
-    }
-
-    private func drawGauge(_ bar: LimitBar, in rect: NSRect) {
-        strokeRing(center: NSPoint(x: rect.midX, y: rect.minY + 62),
-                   radius: 24, lineWidth: 5.5, percent: bar.percent)
-
-        // Centered, truncating inside the cell so long model names can't
-        // spill into the neighboring gauge.
-        func drawCentered(_ s: String, y: CGFloat, font: NSFont, color: NSColor) {
-            let para = NSMutableParagraphStyle()
-            para.alignment = .center
-            para.lineBreakMode = .byTruncatingTail
-            (s as NSString).draw(
-                in: NSRect(x: rect.minX + 2, y: y, width: rect.width - 4, height: font.pointSize + 5),
-                withAttributes: [.font: font, .foregroundColor: color, .paragraphStyle: para])
-        }
-
-        drawCentered(String(format: "%.0f%%", bar.percent), y: rect.minY + 53,
-                     font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
-                     color: .labelColor)
-        drawCentered(bar.displayName, y: rect.minY + 17,
-                     font: .systemFont(ofSize: 11, weight: .medium), color: .labelColor)
-        if let resets = bar.resetsAt {
-            drawCentered(shortResetText(resets), y: rect.minY + 3,
-                         font: .systemFont(ofSize: 9.5), color: .secondaryLabelColor)
-        }
-    }
-}
-
-/// Today's spend by hour as a mini bar chart; the current hour is highlighted.
-final class HourBarsView: NSView {
-    private let costs: [Double]
-    private let currentHour: Int
-
-    init(hourCosts: [Double], now: Date) {
-        // Show midnight through the current hour.
-        self.currentHour = Calendar.current.component(.hour, from: now)
-        self.costs = Array(hourCosts.prefix(currentHour + 1))
-        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 46))
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let inset: CGFloat = 14
-        let chartWidth = bounds.width - inset * 2
-        let maxCost = max(costs.max() ?? 0, 0.01)
-        let barArea: CGFloat = 28
-        let n = max(costs.count, 6)
-        let step = chartWidth / CGFloat(n)
-        let barWidth = max(step - 2, 2)
-
-        for (i, c) in costs.enumerated() {
-            guard c > 0 else { continue }
-            let h = max(barArea * CGFloat(c / maxCost), 1.5)
-            let r = NSRect(x: inset + CGFloat(i) * step, y: 4, width: barWidth, height: h)
-            let color: NSColor = i == currentHour ? .controlAccentColor
-                                                  : .controlAccentColor.withAlphaComponent(0.55)
-            color.setFill()
-            NSBezierPath(roundedRect: r, xRadius: 1.5, yRadius: 1.5).fill()
-        }
-
-        let peak = "peak \(money(maxCost))/h" as NSString
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9.5),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let w = peak.size(withAttributes: attrs).width
-        peak.draw(at: NSPoint(x: bounds.width - inset - w, y: bounds.height - 12), withAttributes: attrs)
-    }
-}
-
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
+    private let dashboard = DashboardModel()
+    private let popover = NSPopover()
+    private var settingsMenu = NSMenu()
+    private var pendingProviders: Set<UsageProvider> = []
+    private var previewWindow: NSWindow?
+    private let isPreview = CommandLine.arguments.contains("--ui-preview")
     private let reader = UsageReader()
+    private let codexReader = CodexUsageReader()
     private var timer: Timer?
     private var loadingTimer: Timer?
     private var loadingDots = 0
@@ -1650,16 +2173,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     /// How the plan limits appear in the menu bar itself.
     private enum LimitStyle: String, CaseIterable {
-        case all, worst
+        case all, nonZero, worst
         var label: String {
             switch self {
             case .all: return "All limits"
+            case .nonZero: return "Only non-zero limits"
             case .worst: return "Worst limit only"
             }
         }
     }
     private var limitStyle: LimitStyle {
-        get { LimitStyle(rawValue: UserDefaults.standard.string(forKey: "limitStyle") ?? "") ?? .all }
+        get { LimitStyle(rawValue: UserDefaults.standard.string(forKey: "limitStyle") ?? "") ?? .worst }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "limitStyle") }
     }
 
@@ -1667,10 +2191,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         installEditMenu()   // so ⌘X/⌘C/⌘V/⌘A work in dialog text fields
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         startLoadingAnimation()
-        // A populated menu from the first frame, so the icon is clickable while
-        // the first fetch (Keychain read + network) is still in flight — render()
-        // swaps in the real content, or the Connect button, once it lands.
-        statusItem.menu = loadingMenu()
+        settingsMenu = loadingMenu()
+        configureDashboard()
+        if isPreview {
+            dashboard.provider = .codex
+            showPreview()
+            return
+        }
         UNUserNotificationCenter.current().delegate = self
         if LimitNotifier.shared.enabled { LimitNotifier.shared.requestAuthorization() }
 
@@ -1680,13 +2207,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             startPolling()
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.showLimitsOnboarding()
+                self?.showProviderOnboarding()
+                if UsageProvider.current == .claude {
+                    self?.showLimitsOnboarding()
+                } else {
+                    UserDefaults.standard.set(true, forKey: "didOnboardLimits")
+                }
                 self?.startPolling()
             }
         }
     }
 
+    private func changeProvider(_ provider: UsageProvider) {
+        guard provider != dashboard.provider else { return }
+        dashboard.provider = provider
+        dashboard.snapshot = nil
+        dashboard.updatedAt = nil
+        if isPreview {
+            render(DashboardPreview.snapshot(provider: provider), now: Date())
+            return
+        }
+        UserDefaults.standard.set(provider.rawValue, forKey: "usageProvider")
+        startLoadingAnimation()
+        settingsMenu = loadingMenu()
+        refresh(forceLimits: true)
+    }
+
+    private func configureDashboard() {
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(toggleDashboard)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        popover.behavior = .transient
+        popover.animates = false
+        let dashboardHeight = DashboardLayout.height(on: statusItem.button?.window?.screen ?? NSScreen.main)
+        popover.contentViewController = NSHostingController(rootView: DashboardView(
+            model: dashboard,
+            selectProvider: { [weak self] in self?.changeProvider($0) },
+            refresh: { [weak self] in self?.refreshClicked() },
+            settings: { [weak self] in self?.showSettings() },
+            connect: { [weak self] in
+                self?.popover.performClose(nil)
+                self?.signIn()
+            },
+            height: dashboardHeight))
+        popover.contentSize = NSSize(width: 480, height: dashboardHeight)
+    }
+
+    @objc private func toggleDashboard() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showSettings()
+        } else if popover.isShown {
+            popover.performClose(nil)
+        } else if let button = statusItem.button {
+            // Re-evaluate the available space when opened on a different display.
+            let height = DashboardLayout.height(on: button.window?.screen ?? NSScreen.main)
+            if let hosting = popover.contentViewController as? NSHostingController<DashboardView> {
+                hosting.rootView.height = height
+            }
+            popover.contentSize = NSSize(width: 480, height: height)
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    private func showSettings() {
+        guard let button = statusItem.button else { return }
+        popover.performClose(nil)
+        if isPreview {
+            let previewMenu = NSMenu()
+            previewMenu.addItem(withTitle: "Preview uses sample data", action: nil, keyEquivalent: "")
+            let refresh = previewMenu.addItem(withTitle: "Refresh sample data", action: #selector(refreshClicked), keyEquivalent: "r")
+            refresh.target = self
+            let quit = previewMenu.addItem(withTitle: "Quit preview", action: #selector(quit), keyEquivalent: "q")
+            quit.target = self
+            previewMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+            return
+        }
+        settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+    }
+
+    /// Synthetic fixtures avoid account requests, log reads, and saved preferences.
+    private func showPreview() {
+        stopLoadingAnimation()
+        render(DashboardPreview.snapshot(provider: dashboard.provider), now: Date())
+        if CommandLine.arguments.contains("--activity") { dashboard.page = .activity }
+        let height = DashboardLayout.height(on: NSScreen.main)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: height),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Halo UI Preview"
+        window.contentViewController = NSHostingController(rootView: DashboardView(
+            model: dashboard, selectProvider: { [weak self] in self?.changeProvider($0) },
+            refresh: { [weak self] in self?.refreshClicked() },
+            settings: { [weak self] in self?.showSettings() }, connect: {}, height: height))
+        if CommandLine.arguments.contains("--dark") { window.appearance = NSAppearance(named: .darkAqua) }
+        if CommandLine.arguments.contains("--light") { window.appearance = NSAppearance(named: .aqua) }
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        previewWindow = window
+    }
+
     private func startPolling() {
+        dashboard.provider = UsageProvider.current
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
     }
@@ -1710,6 +2333,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private enum OnboardStep { case choose, connectOffer, localOffer, officialSetup, done }
 
+    private func showProviderOnboarding() {
+        let alert = NSAlert()
+        alert.messageText = "Welcome to Halo Usage"
+        alert.informativeText = "Choose the coding agent to monitor. You can switch between them anytime from the menu."
+        alert.addButton(withTitle: "Claude Code")
+        alert.addButton(withTitle: "Codex")
+        NSApp.activate(ignoringOtherApps: true)
+        let provider: UsageProvider = alert.runModal() == .alertSecondButtonReturn ? .codex : .claude
+        UserDefaults.standard.set(provider.rawValue, forKey: "usageProvider")
+    }
+
     /// One-time welcome that frames the token-vs-local choice up front instead of
     /// burying it in a submenu. A small state machine so every "← Back"/"Cancel"
     /// returns to the previous step rather than dead-ending. Runs before the first
@@ -1722,7 +2356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             switch step {
             case .choose:
                 let a = NSAlert()
-                a.messageText = "Welcome to Halo for Claude"
+                a.messageText = "Claude limit source"
                 a.informativeText = """
                 Halo shows how much of each Claude Code plan limit you've used, \
                 right in your menu bar. How should it read your limits?
@@ -1802,8 +2436,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         completionHandler([.banner, .sound])
     }
 
-    @objc private func refreshClicked() { refresh(forceLimits: true) }
+    @objc private func refreshClicked() {
+        if isPreview {
+            render(DashboardPreview.snapshot(provider: dashboard.provider), now: Date())
+        } else {
+            refresh(forceLimits: true)
+        }
+    }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func setProvider(_ sender: NSMenuItem) {
+        guard let provider = UsageProvider(rawValue: sender.representedObject as? String ?? "") else { return }
+        changeProvider(provider)
+    }
 
     @objc private func setTitleMode(_ sender: NSMenuItem) {
         if let mode = TitleMode(rawValue: sender.representedObject as? String ?? "") {
@@ -1879,8 +2524,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc private func explain() {
         let alert = NSAlert()
         alert.messageText = "What am I looking at?"
+        if UsageProvider.current == .codex {
+            alert.informativeText = """
+            PLAN LIMITS — official Codex rate-limit buckets. Halo shows every window \
+            returned by Codex, including account-wide limits and model-specific \
+            limits for Sol, Terra, Luna, Astra, Spark, or future models. Each ring \
+            turns orange at 70% and red at 90%; each row includes its reset time.
+
+            LOCAL ACTIVITY — tokens from Codex rollout logs in ~/.codex/sessions. \
+            Cached input is already part of Codex input tokens, so Halo shows it \
+            separately but never counts it twice. Project and model totals cover \
+            activity stored on this Mac.
+
+            ACCOUNT USAGE — lifetime and daily account summaries supplied by the \
+            official Codex app-server. Halo asks the local Codex process, which \
+            owns the ChatGPT login; Halo never reads your Codex access token.
+
+            NOTIFICATIONS — warnings at 80% and 95%, projected exhaustion, unused \
+            capacity before reset, and completed resets. Each fires at most once \
+            per limit window.
+            """
+            alert.addButton(withTitle: "Got it")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return
+        }
         alert.informativeText = """
-        RINGS — how much of each Claude plan rate limit you've used, straight from \
+        PLAN LIMITS — how much of each Claude plan rate limit you've used, straight from \
         your account (the same numbers as claude.ai's usage page). "5-hour" is the \
         rolling session limit, "Weekly" covers all models, and a model-named ring \
         (e.g. Fable) is that model's own weekly limit. Each ring fills clockwise and \
@@ -2040,163 +2710,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// `forceLimits` bypasses the limits-fetch rate limit; only user-initiated
     /// refreshes set it, so the 60s timer can't hammer the endpoint into a 429.
     private func refresh(forceLimits: Bool = false) {
+        let provider = UsageProvider.current
+        guard pendingProviders.insert(provider).inserted else { return }
+        dashboard.refreshing = true
         refreshQueue.async { [weak self] in
             guard let self else { return }
             let now = Date()
-            let snap = UsageMath.snapshot(reader: self.reader, now: now, forceLimits: forceLimits)
-            DispatchQueue.main.async { self.render(snap, now: now) }
+            let snap: Snapshot
+            switch provider {
+            case .claude:
+                snap = UsageMath.snapshot(reader: self.reader, now: now, forceLimits: forceLimits)
+            case .codex:
+                snap = UsageMath.codexSnapshot(reader: self.codexReader, now: now, forceLimits: forceLimits)
+            }
+            DispatchQueue.main.async {
+                self.pendingProviders.remove(provider)
+                // Discard results from a service that is no longer selected.
+                guard provider == self.dashboard.provider else { return }
+                self.render(snap, now: now)
+            }
         }
     }
 
     private func render(_ snap: Snapshot, now: Date) {
-        stopLoadingAnimation()   // real data has landed; drop the "Halo…" placeholder
-        let menu = NSMenu()
-
-        // Account limit gauges (like claude.ai's usage popup)
-        let bars = snap.limits.map { $0.bars } ?? []
-        if bars.isEmpty { statusItem.button?.image = nil }
-        if let limits = snap.limits, !bars.isEmpty {
+        stopLoadingAnimation()
+        dashboard.snapshot = snap
+        dashboard.updatedAt = now
+        dashboard.refreshing = false
+        let provider = snap.provider
+        let bars = snap.limits?.bars ?? []
+        if !bars.isEmpty {
             setStatusTitle(bars)
-            if !limits.stale { LimitNotifier.shared.check(bars, now: now) }
-
-            let source = bars.first?.source ?? .live
-            let headerText: String
-            switch source {
-            case .estimated: headerText = "Plan usage limits  (estimated)"
-            case .official, .live:
-                headerText = limits.stale
-                    ? "Plan usage limits  (as of \(timeHM(limits.fetchedAt)))"
-                    : "Plan usage limits"
+            if snap.limits?.stale == false && !isPreview {
+                LimitNotifier.shared.check(bars, now: now)
             }
-            menu.addItem(header(headerText))
-            let subtitle: String
-            switch source {
-            case .official: subtitle = "Official, straight from Claude Code — no account fetch"
-            case .live:     subtitle = "How much of each plan limit you've used — resets at the time shown"
-            case .estimated: subtitle = "Estimated from your local logs — live limits are unavailable"
-            }
-            menu.addItem(coloredInfo([(subtitle, .secondaryLabelColor)], size: 11))
-            let rings = NSMenuItem()
-            rings.view = RingGaugesView(bars)
-            menu.addItem(rings)
-            menu.addItem(.separator())
-        } else if snap.limits == nil {
-            if let hint = snap.limitsHint {
-                menu.addItem(coloredInfo([(hint, .secondaryLabelColor)], size: 12))
-            }
-            let connect = NSMenuItem(title: "Connect to Claude…", action: #selector(signIn), keyEquivalent: "")
-            connect.target = self
-            menu.addItem(connect)
-            menu.addItem(.separator())
         } else {
-            // Credentials are fine and the first fetch hasn't landed yet; say so
-            // rather than leaving the section silently absent.
-            menu.addItem(coloredInfo([("Fetching plan limits…", .secondaryLabelColor)], size: 12))
-            menu.addItem(.separator())
-        }
-
-        if !snap.insights.isEmpty {
-            menu.addItem(header("Insights"))
-            for insight in snap.insights {
-                menu.addItem(coloredInfo([
-                    ("● ", Self.severityColor(insight.severity)),
-                    (insight.text, .labelColor),
-                ], size: 12))
-            }
-            menu.addItem(.separator())
-        }
-
-        if !snap.sessions.isEmpty {
-            menu.addItem(header("Active sessions"))
-            for s in snap.sessions {
-                let ctxColor = Insight.contextSeverity(s.contextTokens)
-                    .map(Self.severityColor) ?? .secondaryLabelColor
-                menu.addItem(coloredInfo([
-                    ("   \(s.project)", .labelColor),
-                    ("  \(s.model)", .secondaryLabelColor),
-                    ("  ctx \(compactTokens(s.contextTokens))", ctxColor),
-                    ("  \(money(s.costToday)) today", .secondaryLabelColor),
-                ], size: 12))
-            }
-            menu.addItem(.separator())
-        }
-
-        if let b = snap.block {
-            let s = b.stats
-            if bars.isEmpty {
-                switch titleMode {
-                case .both: statusItem.button?.title = "Halo \(compactTokens(s.totalTokens)) · \(money(s.cost))"
-                case .tokens: statusItem.button?.title = "Halo \(compactTokens(s.totalTokens))"
-                case .cost: statusItem.button?.title = "Halo \(money(s.cost))"
+            statusItem.button?.image = nil
+            statusItem.button?.attributedTitle = NSAttributedString(string: "")
+            if let stats = snap.block?.stats {
+                if provider == .codex {
+                    statusItem.button?.title = "Codex \(compactTokens(stats.totalTokens))"
+                } else {
+                    switch titleMode {
+                    case .both: statusItem.button?.title = "Halo \(compactTokens(stats.totalTokens)) · \(money(stats.cost))"
+                    case .tokens: statusItem.button?.title = "Halo \(compactTokens(stats.totalTokens))"
+                    case .cost: statusItem.button?.title = "Halo \(money(stats.cost))"
+                    }
                 }
+            } else {
+                statusItem.button?.title = "\(provider.shortLabel) idle"
             }
-
-            menu.addItem(header("Current 5-hour session  (\(timeHM(b.start))–\(timeHM(b.end)))"))
-            menu.addItem(info("Tokens: \(compactTokens(s.totalTokens))   Cost: \(money(s.cost))"))
-            let io = info("In \(compactTokens(s.inputTokens)) · Out \(compactTokens(s.outputTokens)) · CacheW \(compactTokens(s.cacheCreationTokens)) · CacheR \(compactTokens(s.cacheReadTokens))")
-            io.toolTip = "Input / output tokens, plus prompt-cache writes and reads (cache reads are ~10× cheaper than input)"
-            menu.addItem(io)
-
-            let elapsed = now.timeIntervalSince(b.start)
-            let remaining = max(0, b.end.timeIntervalSince(now))
-            if elapsed > 60 {
-                let perMin = Double(s.totalTokens) / (elapsed / 60)
-                menu.addItem(info(String(format: "Burn rate: %@/min   Resets in %dh %02dm",
-                                         compactTokens(Int(perMin)), Int(remaining) / 3600, (Int(remaining) % 3600) / 60)))
-            }
-            addModelBreakdown(s, to: menu)
-        } else {
-            if bars.isEmpty {
-                statusItem.button?.title = "Halo idle"
-            }
-            menu.addItem(header("No active 5h block"))
         }
-
-        menu.addItem(.separator())
-        menu.addItem(header("Today"))
-        menu.addItem(info("Tokens: \(compactTokens(snap.today.totalTokens))   Cost: \(money(snap.today.cost))"))
-        if snap.today.cost > 0 {
-            let chart = NSMenuItem()
-            chart.view = HourBarsView(hourCosts: snap.hourCosts, now: now)
-            menu.addItem(chart)
+        statusItem.button?.setAccessibilityLabel("Halo \(provider.shortLabel) usage")
+        statusItem.button?.toolTip = "Halo · \(provider.shortLabel) usage. Click for details; right-click for settings."
+        let menu = NSMenu()
+        menu.addItem(menuSection("Service"))
+        for candidate in UsageProvider.allCases {
+            let item = NSMenuItem(title: candidate.label, action: #selector(setProvider(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = candidate.rawValue
+            item.state = candidate == provider ? .on : .off
+            menu.addItem(item)
         }
-        addModelBreakdown(snap.today, to: menu)
-
         menu.addItem(.separator())
-        menu.addItem(header("Last 7 days"))
-        menu.addItem(info("Tokens: \(compactTokens(snap.week.totalTokens))   Cost: \(money(snap.week.cost))"))
 
-        menu.addItem(.separator())
-        let display = NSMenuItem(title: "Menu bar shows", action: nil, keyEquivalent: "")
-        let sub = NSMenu()
+        menu.addItem(menuSection("Menu bar shows"))
         for style in LimitStyle.allCases {
             let i = NSMenuItem(title: style.label, action: #selector(setLimitStyle(_:)), keyEquivalent: "")
             i.target = self
             i.representedObject = style.rawValue
             i.state = (style == limitStyle) ? .on : .off
-            sub.addItem(i)
+            menu.addItem(i)
         }
-        sub.addItem(.separator())
-        // No action → auto-disabled, acts as a section label.
-        sub.addItem(NSMenuItem(title: "When limits are unavailable:", action: nil, keyEquivalent: ""))
-        for mode in TitleMode.allCases {
-            let i = NSMenuItem(title: mode.label, action: #selector(setTitleMode(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = mode.rawValue
-            i.state = (mode == titleMode) ? .on : .off
-            sub.addItem(i)
+        if provider == .claude {
+            menu.addItem(.separator())
+            menu.addItem(menuSection("When limits are unavailable"))
+            for mode in TitleMode.allCases {
+                let i = NSMenuItem(title: mode.label, action: #selector(setTitleMode(_:)), keyEquivalent: "")
+                i.target = self
+                i.representedObject = mode.rawValue
+                i.state = (mode == titleMode) ? .on : .off
+                menu.addItem(i)
+            }
         }
-        display.submenu = sub
-        menu.addItem(display)
+        menu.addItem(.separator())
 
-        let notify = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
-        let nsub = NSMenu()
+        menu.addItem(menuSection("Notifications"))
         let master = NSMenuItem(title: "Enable notifications",
                                 action: #selector(toggleNotifications), keyEquivalent: "")
         master.target = self
         master.state = LimitNotifier.shared.enabled ? .on : .off
-        nsub.addItem(master)
-        nsub.addItem(.separator())
+        menu.addItem(master)
         for kind in NotifyKind.allCases {
             let i = NSMenuItem(title: kind.label, action: #selector(toggleNotifyKind(_:)), keyEquivalent: "")
             // Leave them visible but inert when the master switch is off, so it's
@@ -2205,41 +2809,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             i.representedObject = kind.rawValue
             i.state = kind.enabled ? .on : .off
             i.toolTip = kind.detail
-            nsub.addItem(i)
+            menu.addItem(i)
         }
-        notify.submenu = nsub
-        menu.addItem(notify)
 
+        menu.addItem(.separator())
         let login = NSMenuItem(title: "Launch at login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         login.target = self
         login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
         menu.addItem(login)
 
-        let src = NSMenuItem(title: "Plan limits source", action: nil, keyEquivalent: "")
-        let ssub = NSMenu()
-        let srcHeader = NSMenuItem(title: "Where the % rings come from:", action: nil, keyEquivalent: "")
-        srcHeader.isEnabled = false
-        ssub.addItem(srcHeader)
-        for mode in LimitsSource.allCases {
-            let it = NSMenuItem(title: mode.label, action: #selector(setLimitsSource(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = mode.rawValue
-            it.state = (LimitsSource.current == mode) ? .on : .off
-            ssub.addItem(it)
+        if provider == .claude {
+            menu.addItem(.separator())
+            menu.addItem(menuSection("Plan limits source"))
+            for mode in LimitsSource.allCases {
+                let it = NSMenuItem(title: mode.label, action: #selector(setLimitsSource(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = mode.rawValue
+                it.state = (LimitsSource.current == mode) ? .on : .off
+                menu.addItem(it)
+            }
+            let setup = NSMenuItem(title: Self.statuslineConfigured() ? "Official limits: on ✓" : "Set up official limits…",
+                                   action: #selector(enableOfficialLimits), keyEquivalent: "")
+            setup.target = self
+            setup.toolTip = "Points Claude Code's status line at Halo so it hands over its real limits locally — exact, and no token."
+            menu.addItem(setup)
+            let explainItem = NSMenuItem(title: "What's the difference?", action: #selector(explainLimitsSource), keyEquivalent: "")
+            explainItem.target = self
+            menu.addItem(explainItem)
         }
-        ssub.addItem(.separator())
-        let setup = NSMenuItem(title: Self.statuslineConfigured() ? "Official limits: on ✓" : "Set up official limits…",
-                               action: #selector(enableOfficialLimits), keyEquivalent: "")
-        setup.target = self
-        setup.toolTip = "Points Claude Code's status line at Halo so it hands over its real limits locally — exact, and no token."
-        ssub.addItem(setup)
-        let explainItem = NSMenuItem(title: "What's the difference?", action: #selector(explainLimitsSource), keyEquivalent: "")
-        explainItem.target = self
-        ssub.addItem(explainItem)
-        src.submenu = ssub
-        menu.addItem(src)
 
-        if snap.limits != nil {
+        if provider == .claude, snap.limits != nil {
             let out = NSMenuItem(title: "Disconnect from Claude", action: #selector(disconnect), keyEquivalent: "")
             out.target = self
             out.toolTip = "Removes Halo's own connection. Claude Code's login is never touched."
@@ -2255,32 +2854,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let q = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"); q.target = self
         menu.addItem(q)
 
-        statusItem.menu = menu
-    }
-
-    private static func severityColor(_ s: Insight.Severity) -> NSColor {
-        switch s {
-        case .info: return .systemBlue
-        case .warn: return .systemOrange
-        case .alert: return .systemRed
-        }
-    }
-
-    private static let modelDots: [String: NSColor] = [
-        "Fable": .systemPurple, "Opus": .systemIndigo,
-        "Sonnet": .systemBlue, "Haiku": .systemTeal,
-    ]
-
-    private func addModelBreakdown(_ s: Stats, to menu: NSMenu) {
-        let models = s.byModel
-        guard models.count > 1 || (models.first.map { $0.0 != "unknown" } ?? false) else { return }
-        for (name, tokens, cost) in models {
-            menu.addItem(coloredInfo([
-                ("   ● ", Self.modelDots[name] ?? .systemGray),
-                ("\(name): ", .labelColor),
-                ("\(compactTokens(tokens)) · \(money(cost))", .secondaryLabelColor),
-            ], size: 13))
-        }
+        settingsMenu = menu
     }
 
     /// Sets the status bar to one colored progress ring per limit, each
@@ -2294,6 +2868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let shown: [LimitBar]
         switch limitStyle {
         case .all: shown = bars
+        case .nonZero: shown = bars.filter { $0.percent > 0 }
         case .worst: shown = bars.max { $0.percent < $1.percent }.map { [$0] } ?? []
         }
 
@@ -2315,6 +2890,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 string: String(format: " %@ %.0f%%", bar.shortLabel, bar.percent),
                 attributes: [.font: font, .foregroundColor: color, .baselineOffset: -0.5]))
         }
+        // Resetting the variable length here makes AppKit recalculate the
+        // status item's width whenever a newly non-zero limit joins this list.
+        statusItem.length = NSStatusItem.variableLength
         statusItem.button?.attributedTitle = title
     }
 
@@ -2333,12 +2911,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Animated "Halo…" in the menu bar while the first snapshot is in flight.
     private func startLoadingAnimation() {
         loadingDots = 0
-        statusItem.button?.title = "Halo"
+        let base = "Halo \(UsageProvider.current.shortLabel)"
+        let font = statusItem.button?.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        // Every frame has the same glyphs and width. Hide the unused dots with
+        // color so neither the status item nor its centered text moves.
+        let frames = (0..<4).map { visibleDots -> NSAttributedString in
+            let title = NSMutableAttributedString(string: base + "...", attributes: [
+                .font: font, .foregroundColor: NSColor.labelColor,
+            ])
+            if visibleDots < 3 {
+                title.addAttribute(.foregroundColor, value: NSColor.clear,
+                                   range: NSRange(location: base.utf16.count + visibleDots,
+                                                  length: 3 - visibleDots))
+            }
+            return title
+        }
+        statusItem.button?.image = nil
+        statusItem.button?.attributedTitle = frames[0]
+        statusItem.button?.setAccessibilityLabel("\(base), loading usage")
         loadingTimer?.invalidate()
         loadingTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.loadingDots = (self.loadingDots + 1) % 4
-            self.statusItem.button?.title = "Halo" + String(repeating: ".", count: self.loadingDots)
+            self.statusItem.button?.attributedTitle = frames[self.loadingDots]
         }
     }
 
@@ -2347,13 +2942,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         loadingTimer = nil
     }
 
-    /// Placeholder menu shown before the first snapshot lands, so a fresh launch
-    /// is never a blank, unclickable icon.
+    /// Settings remain available while the dashboard loads its first snapshot.
     private func loadingMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(header("Halo for Claude"))
-        menu.addItem(coloredInfo([("Loading usage… macOS may ask to read Claude Code's login.",
-                                   .secondaryLabelColor)], size: 12))
+        let provider = UsageProvider.current
+        menu.addItem(header("Halo Usage · \(provider.shortLabel)"))
+        let message = provider == .claude
+            ? "Loading usage… macOS may ask to read Claude Code's login."
+            : "Loading Codex limits and local activity…"
+        menu.addItem(coloredInfo([(message, .secondaryLabelColor)], size: 12))
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -2366,7 +2963,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         i.attributedTitle = NSAttributedString(string: s, attributes: [.font: NSFont.boldSystemFont(ofSize: 12)])
         return i
     }
-    private func info(_ s: String) -> NSMenuItem { NSMenuItem(title: s, action: nil, keyEquivalent: "") }
+
+    /// A non-interactive title for a flat right-click menu. Unlike a submenu
+    /// parent, it does not require hovering over a disclosure arrow to reveal
+    /// the choices below it.
+    private func menuSection(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                         .foregroundColor: NSColor.secondaryLabelColor])
+        return item
+    }
 
     private func coloredInfo(_ parts: [(String, NSColor)], size: CGFloat) -> NSMenuItem {
         let str = NSMutableAttributedString()
@@ -2389,8 +2998,23 @@ if CommandLine.arguments.contains("--statusline") {
     exit(0)
 }
 
+// Read-only diagnostic used by maintainers and support. It exercises the same
+// Codex account and JSONL paths as the menu without launching AppKit, and never
+// prints account identifiers, credentials, prompts, or project names.
+if CommandLine.arguments.contains("--codex-probe") {
+    let account = CodexAccount.shared.fetch(force: true)
+    let local = CodexUsageReader().entries(since: Date().addingTimeInterval(-7 * 24 * 3600))
+    print("limits=\(account.limits?.bars.count ?? 0) local_entries=\(local.count) local_tokens=\(local.reduce(0) { $0 + $1.totalTokens })")
+    for bar in account.limits?.bars ?? [] {
+        print("\(bar.displayName) \(Int(bar.percent.rounded()))% \(bar.shortLabel)")
+    }
+    if let lifetime = account.usage?.lifetimeTokens { print("lifetime_tokens=\(lifetime)") }
+    if let hint = account.hint { print("hint=\(hint)") }
+    exit(0)
+}
+
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(CommandLine.arguments.contains("--ui-preview") ? .regular : .accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
