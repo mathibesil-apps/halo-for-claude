@@ -31,8 +31,8 @@ Applications. The universal app requires macOS 13 Ventura or later.
 ### Build from source
 
 ```bash
-git clone https://github.com/mathibesil-apps/halo-for-claude.git
-cd halo-for-claude
+git clone https://github.com/mathibesil-apps/halo-for-usage.git
+cd halo-for-usage
 ./build.sh
 cp -r "Halo Usage.app" /Applications
 open "/Applications/Halo Usage.app"
