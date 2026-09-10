@@ -9,11 +9,8 @@ overview of plan limits and local activity, with notifications before a limit
 is exhausted.
 
 <p align="center">
-  <img src="docs/dashboard-overview.png" alt="Halo's Codex overview: plan limits, local activity, and insights" width="360">
-  <img src="docs/dashboard-activity.png" alt="Halo's Codex activity view with hourly usage and active sessions" width="360">
+  <img src="docs/menubar.png" alt="Usage rings in the macOS menu bar" width="220">
 </p>
-
-<sub>Screenshots use Halo's built-in sample data; no personal project names or account information are shown.</sub>
 
 The menu bar defaults to the most-used limit. Open Halo to see every limit in
 its own row, with the full name, percentage used, remaining capacity, and reset
