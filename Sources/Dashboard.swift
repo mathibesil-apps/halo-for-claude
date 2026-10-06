@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 enum DashboardLayout {
@@ -16,6 +17,9 @@ final class DashboardModel: ObservableObject {
     @Published var refreshing = true
     @Published var updatedAt: Date?
     @Published var page = DashboardPage.overview
+    /// `nil` shows all local activity; a value selects one anonymous
+    /// account source without exposing provider or organization names in UI.
+    @Published var accountSourceKey: String?
 }
 
 enum DashboardPage: String, CaseIterable {
@@ -31,6 +35,8 @@ struct DashboardView: View {
     var settings: () -> Void
     var connect: () -> Void
     var height: CGFloat = DashboardLayout.preferredHeight
+    @State private var showRefreshComplete = false
+    @State private var completionGeneration = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -77,6 +83,21 @@ struct DashboardView: View {
         .foregroundStyle(.primary)
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(width: 480, height: height)
+        .onReceive(model.$refreshing.dropFirst().removeDuplicates()) { refreshing in
+            completionGeneration += 1
+            let generation = completionGeneration
+            if refreshing {
+                withAnimation(.easeOut(duration: 0.15)) { showRefreshComplete = false }
+            } else {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.68)) {
+                    showRefreshComplete = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    guard generation == completionGeneration, !model.refreshing else { return }
+                    withAnimation(.easeOut(duration: 0.2)) { showRefreshComplete = false }
+                }
+            }
+        }
     }
 
     private var toolbar: some View {
@@ -114,7 +135,12 @@ struct DashboardView: View {
                 Text("Waiting for usage")
             }
             Spacer()
-            Button(action: refresh) { Label("Refresh", systemImage: "arrow.clockwise") }
+            Button(action: refresh) {
+                HStack(spacing: 6) {
+                    RefreshGlyph(refreshing: model.refreshing, completed: showRefreshComplete)
+                    Text(showRefreshComplete ? "Updated" : "Refresh")
+                }
+            }
                 .buttonStyle(.borderless)
                 .disabled(model.refreshing)
                 .keyboardShortcut("r", modifiers: .command)
@@ -127,7 +153,7 @@ struct DashboardView: View {
     @ViewBuilder private func limits(_ snap: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                sectionTitle("Plan limits")
+                sectionTitle(snap.provider == .codex ? "Current ChatGPT plan limits" : "Plan limits")
                 Spacer()
                 Text("Percentage used").foregroundStyle(.secondary)
             }
@@ -158,19 +184,29 @@ struct DashboardView: View {
     }
 
     private func totals(_ snap: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let sources = accountSources(in: snap)
+        let selectedSource = effectiveAccountSelection(in: sources)
+        let today = scoped(snap.today, to: selectedSource)
+        let week = scoped(snap.week, to: selectedSource)
+        let sessions = scopedSessions(snap.sessions, to: selectedSource)
+
+        return VStack(alignment: .leading, spacing: 16) {
             HStack {
                 sectionTitle("Local activity")
                 Spacer()
-                Text("On this Mac").foregroundStyle(.secondary)
+                Text(localScopeDescription(selectedSource: selectedSource, sources: sources))
+                    .foregroundStyle(.secondary)
+            }
+            if sources.count > 1 {
+                accountPicker(sources)
             }
             HStack(alignment: .top, spacing: 24) {
-                metric("Today", value: compactTokens(snap.today.totalTokens), detail: "tokens")
+                metric("Today", value: compactTokens(today.totalTokens), detail: "tokens")
                 Divider()
-                metric("Last 7 days", value: compactTokens(snap.week.totalTokens), detail: "tokens")
+                metric("Last 7 days", value: compactTokens(week.totalTokens), detail: "tokens")
             }.fixedSize(horizontal: false, vertical: true)
             if snap.provider == .claude {
-                detailRow("API cost equivalent today", value: money(snap.today.cost))
+                detailRow("API cost equivalent today", value: money(today.cost))
                 Text("An estimate at API prices, not a subscription charge.")
                     .foregroundStyle(.secondary)
             }
@@ -181,7 +217,7 @@ struct DashboardView: View {
                 HStack {
                     Text("Explore activity")
                     Spacer()
-                    Text("\(snap.sessions.count) active \(snap.sessions.count == 1 ? "session" : "sessions")")
+                    Text("\(sessions.count) active \(sessions.count == 1 ? "session" : "sessions")")
                         .foregroundStyle(.secondary)
                     Image(systemName: "chevron.right")
                 }
@@ -192,23 +228,44 @@ struct DashboardView: View {
     }
 
     @ViewBuilder private func activity(_ snap: Snapshot) -> some View {
+        let sources = accountSources(in: snap)
+        let selectedSource = effectiveAccountSelection(in: sources)
+        let today = scoped(snap.today, to: selectedSource)
+        let week = scoped(snap.week, to: selectedSource)
+        let block: BlockStats? = {
+            guard let current = snap.block else { return nil }
+            let stats = scoped(current.stats, to: selectedSource)
+            guard selectedSource == nil || !stats.entries.isEmpty else { return nil }
+            return BlockStats(start: current.start, stats: stats)
+        }()
+        let sessions = scopedSessions(snap.sessions, to: selectedSource)
+        let hourlyValues = snap.provider == .codex ? hourlyTokens(in: today) : snap.hourCosts
+
+        if sources.count > 1 {
+            VStack(alignment: .leading, spacing: 10) {
+                sectionTitle("Local account activity")
+                accountPicker(sources)
+            }
+            Divider()
+        }
         VStack(alignment: .leading, spacing: 16) {
             sectionTitle("Today's activity")
-            metric("Total tokens", value: compactTokens(snap.today.totalTokens),
-                   detail: snap.provider == .claude ? "\(money(snap.today.cost)) API cost equivalent" : "On this Mac")
-            if snap.today.totalTokens > 0 {
-                ActivityChart(values: snap.hourCosts, tokens: snap.hourValuesAreTokens,
+            metric("Total tokens", value: compactTokens(today.totalTokens),
+                   detail: snap.provider == .claude ? "\(money(today.cost)) API cost equivalent"
+                   : localScopeDescription(selectedSource: selectedSource, sources: sources))
+            if today.totalTokens > 0 {
+                ActivityChart(values: hourlyValues, tokens: snap.hourValuesAreTokens,
                               now: model.updatedAt ?? Date())
             } else {
                 Text("No activity recorded today. New sessions will appear after the next refresh.")
                     .foregroundStyle(.secondary)
             }
-            modelBreakdown(snap.today, provider: snap.provider)
+            modelBreakdown(today, provider: snap.provider)
         }
         Divider()
         VStack(alignment: .leading, spacing: 14) {
             sectionTitle("Current 5-hour activity")
-            if let block = snap.block {
+            if let block {
                 Text("\(timeHM(block.start))–\(timeHM(block.end)) · Local activity window")
                     .foregroundStyle(.secondary)
                 detailRow("Total tokens", value: compactTokens(block.stats.totalTokens))
@@ -232,17 +289,18 @@ struct DashboardView: View {
         Divider()
         VStack(alignment: .leading, spacing: 16) {
             sectionTitle("Active sessions")
-            if snap.sessions.isEmpty {
+            if sessions.isEmpty {
                 Text("No sessions active in the last 30 minutes.").foregroundStyle(.secondary)
             }
-            ForEach(snap.sessions, id: \.id) { session in
+            ForEach(sessions, id: \.id) { session in
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline) {
                         Text(session.project).fontWeight(.medium)
                             .lineLimit(2).textSelection(.enabled)
                             .help(session.project)
                         Spacer(minLength: 16)
-                        Text(session.model).foregroundStyle(.secondary).lineLimit(2)
+                        Text(sessionLabel(session, selectedSource: selectedSource, sources: sources))
+                            .foregroundStyle(.secondary).lineLimit(2)
                     }
                     HStack(alignment: .firstTextBaseline) {
                         Text("\(compactTokens(session.contextTokens)) context tokens")
@@ -257,16 +315,16 @@ struct DashboardView: View {
         Divider()
         VStack(alignment: .leading, spacing: 14) {
             sectionTitle("Last 7 days")
-            detailRow("Local tokens", value: compactTokens(snap.week.totalTokens))
+            detailRow("Local tokens", value: compactTokens(week.totalTokens))
             if snap.provider == .claude {
-                detailRow("API cost equivalent", value: money(snap.week.cost))
+                detailRow("API cost equivalent", value: money(week.cost))
             }
-            modelBreakdown(snap.week, provider: snap.provider)
+            modelBreakdown(week, provider: snap.provider)
         }
-        if let account = snap.codexAccountUsage {
+        if selectedSource == nil, let account = snap.codexAccountUsage {
             Divider()
             VStack(alignment: .leading, spacing: 14) {
-                sectionTitle("Codex account")
+                sectionTitle("Current ChatGPT account")
                 if let plan = account.planType { detailRow("Plan", value: plan.capitalized) }
                 if let n = account.lifetimeTokens { detailRow("Lifetime tokens", value: compactTokens(n)) }
                 if let n = account.peakDailyTokens { detailRow("Peak day", value: "\(compactTokens(n)) tokens") }
@@ -324,6 +382,96 @@ struct DashboardView: View {
             detailRow(name, value: provider == .codex ? "\(compactTokens(tokens)) tokens"
                       : "\(compactTokens(tokens)) tokens · \(money(cost))")
         }
+    }
+
+    private func accountPicker(_ sources: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Account", selection: $model.accountSourceKey) {
+                Text("All").tag(nil as String?)
+                ForEach(Array(sources.enumerated()), id: \.element) { index, source in
+                    Text("Account \(index + 1)").tag(source as String?)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Text("Accounts are separated using local session metadata; names and credentials are never read.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func accountSources(in snap: Snapshot) -> [String] {
+        snap.week.byAccountSource.map(\.0)
+    }
+
+    private func effectiveAccountSelection(in sources: [String]) -> String? {
+        guard sources.count > 1, let selected = model.accountSourceKey,
+              sources.contains(selected) else { return nil }
+        return selected
+    }
+
+    private func scoped(_ stats: Stats, to source: String?) -> Stats {
+        guard let source else { return stats }
+        return Stats(entries: stats.entries.filter { $0.accountSourceKey == source })
+    }
+
+    private func scopedSessions(_ sessions: [SessionSummary],
+                                to source: String?) -> [SessionSummary] {
+        guard let source else { return sessions }
+        return sessions.filter { $0.accountSourceKey == source }
+    }
+
+    private func hourlyTokens(in stats: Stats) -> [Double] {
+        var values = [Double](repeating: 0, count: 24)
+        for entry in stats.entries {
+            let hour = Calendar.current.component(.hour, from: entry.timestamp)
+            values[hour] += Double(entry.totalTokens)
+        }
+        return values
+    }
+
+    private func accountName(_ source: String, sources: [String]) -> String {
+        guard let index = sources.firstIndex(of: source) else { return "Account" }
+        return "Account \(index + 1)"
+    }
+
+    private func localScopeDescription(selectedSource: String?,
+                                       sources: [String]) -> String {
+        guard sources.count > 1 else { return "On this Mac" }
+        guard let selectedSource else { return "All accounts on this Mac" }
+        return "\(accountName(selectedSource, sources: sources)) on this Mac"
+    }
+
+    private func sessionLabel(_ session: SessionSummary,
+                              selectedSource: String?, sources: [String]) -> String {
+        guard selectedSource == nil, sources.count > 1,
+              let source = session.accountSourceKey else { return session.model }
+        return "\(session.model) · \(accountName(source, sources: sources))"
+    }
+}
+
+private struct RefreshGlyph: View {
+    let refreshing: Bool
+    let completed: Bool
+
+    var body: some View {
+        ZStack {
+            if completed {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .transition(.scale.combined(with: .opacity))
+            } else if refreshing {
+                ProgressView()
+                    .controlSize(.mini)
+                    .progressViewStyle(.circular)
+                .transition(.opacity)
+            } else {
+                Image(systemName: "arrow.clockwise")
+                    .transition(.opacity)
+            }
+        }
+        .frame(width: 16, height: 16)
+        .accessibilityHidden(true)
     }
 }
 

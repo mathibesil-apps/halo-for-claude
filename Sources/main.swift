@@ -60,6 +60,21 @@ enum UsageProvider: String, CaseIterable {
     }
 }
 
+/// The account boundary recorded by Codex in each rollout's session metadata.
+/// This never inspects credentials or account identifiers: it only classifies
+/// the configured model provider so personal and managed-work activity do not
+/// appear as one unexplained total.
+enum CodexAccountKind: String, CaseIterable, Hashable {
+    case personal, managed, unknown
+
+    static func classify(modelProvider: String?) -> CodexAccountKind {
+        let provider = modelProvider?.lowercased() ?? ""
+        if provider == "openai" { return .personal }
+        return provider.isEmpty ? .unknown : .managed
+    }
+
+}
+
 // MARK: - Data model
 
 struct UsageEntry {
@@ -79,11 +94,18 @@ struct UsageEntry {
     /// Claude and Codex report cached input differently. This lets the shared
     /// stats/UI use the right total without double-counting Codex cached tokens.
     let provider: UsageProvider
+    /// Present for Codex rollouts; derived only from session_meta.model_provider.
+    let codexAccountKind: CodexAccountKind?
+    /// Anonymous, deterministic grouping key used only in memory. Claude account
+    /// UUIDs are SHA-256 hashed; Codex uses its coarse provider classification.
+    let accountSourceKey: String?
 
     init(timestamp: Date, model: String, inputTokens: Int, outputTokens: Int,
          cacheCreationTokens: Int, cacheReadTokens: Int, dedupeKey: String,
          sessionId: String, cwd: String, isSidechain: Bool,
-         provider: UsageProvider = .claude) {
+         provider: UsageProvider = .claude,
+         codexAccountKind: CodexAccountKind? = nil,
+         accountSourceKey: String? = nil) {
         self.timestamp = timestamp
         self.model = model
         self.inputTokens = inputTokens
@@ -95,6 +117,8 @@ struct UsageEntry {
         self.cwd = cwd
         self.isSidechain = isSidechain
         self.provider = provider
+        self.codexAccountKind = codexAccountKind
+        self.accountSourceKey = accountSourceKey
     }
 
     var totalTokens: Int {
@@ -138,6 +162,39 @@ struct Stats {
             $0.2 == $1.2 ? $0.1 > $1.1 : $0.2 > $1.2
         }
     }
+
+    /// Codex-only local totals grouped by the provider recorded for each session.
+    var byCodexAccount: [(CodexAccountKind, Int)] {
+        var totals: [CodexAccountKind: Int] = [:]
+        for entry in entries where entry.provider == .codex {
+            totals[entry.codexAccountKind ?? .unknown, default: 0] += entry.totalTokens
+        }
+        let order: [CodexAccountKind] = [.personal, .managed, .unknown]
+        return order.compactMap { kind in
+            guard let tokens = totals[kind], tokens > 0 else { return nil }
+            return (kind, tokens)
+        }
+    }
+
+    /// Known local account sources only. Entries without reliable account
+    /// metadata remain included in All, but never invent an extra account tab.
+    var byAccountSource: [(String, Int)] {
+        var totals: [String: Int] = [:]
+        for entry in entries {
+            guard let key = entry.accountSourceKey else { continue }
+            totals[key, default: 0] += entry.totalTokens
+        }
+        return totals.map { ($0.key, $0.value) }.sorted { $0.0 < $1.0 }
+    }
+}
+
+/// Produces a stable grouping key without retaining or displaying Claude's
+/// account UUID. The original identifier never leaves this stack frame.
+private func anonymousClaudeAccountKey(_ identifier: String) -> String? {
+    guard !identifier.isEmpty else { return nil }
+    let digest = SHA256.hash(data: Data(identifier.utf8))
+    let prefix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    return "claude:\(prefix)"
 }
 
 struct BlockStats {
@@ -265,9 +322,19 @@ final class UsageReader {
         guard let data = FileManager.default.contents(atPath: url.path),
               let text = String(data: data, encoding: .utf8) else { return [] }
         var out: [UsageEntry] = []
+        var accountSourceKey: String?
         for line in text.split(separator: "\n") {
-            guard line.contains("\"usage\"") else { continue }
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+            let hasUsage = line.contains("\"usage\"")
+            let hasAccount = line.contains("\"accountUuid\"")
+            guard hasUsage || hasAccount,
+                  let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            else { continue }
+
+            if let accountUUID = obj["accountUuid"] as? String {
+                accountSourceKey = anonymousClaudeAccountKey(accountUUID)
+            }
+
+            guard hasUsage,
                   let tsStr = obj["timestamp"] as? String,
                   let ts = parseDate(tsStr),
                   let message = obj["message"] as? [String: Any],
@@ -290,7 +357,8 @@ final class UsageReader {
                 }(),
                 sessionId: (obj["sessionId"] as? String) ?? "",
                 cwd: (obj["cwd"] as? String) ?? "",
-                isSidechain: (obj["isSidechain"] as? Bool) ?? false
+                isSidechain: (obj["isSidechain"] as? Bool) ?? false,
+                accountSourceKey: accountSourceKey
             ))
         }
         return out
@@ -374,6 +442,7 @@ final class CodexUsageReader {
         var cwd = ""
         var model = ""
         var sidechain = false
+        var accountKind = CodexAccountKind.unknown
         var out: [UsageEntry] = []
 
         for line in text.split(separator: "\n") {
@@ -390,6 +459,8 @@ final class CodexUsageReader {
                 // Root sessions use a string source (cli/vscode); subagents use
                 // a tagged object such as {subagent:{...}}.
                 sidechain = payload["source"] is [String: Any]
+                accountKind = CodexAccountKind.classify(
+                    modelProvider: payload["model_provider"] as? String)
 
             case "turn_context":
                 model = (payload["model"] as? String) ?? model
@@ -422,7 +493,9 @@ final class CodexUsageReader {
                     sessionId: sessionId,
                     cwd: cwd,
                     isSidechain: sidechain,
-                    provider: .codex
+                    provider: .codex,
+                    codexAccountKind: accountKind,
+                    accountSourceKey: accountKind == .unknown ? nil : "codex:\(accountKind.rawValue)"
                 ))
 
             default:
@@ -1772,6 +1845,7 @@ struct SessionSummary {
     let contextTokens: Int     // latest turn's prompt size — resent every message
     let costToday: Double
     let tokensToday: Int
+    let accountSourceKey: String?
 }
 
 /// One advisory line for the Insights section.
@@ -1877,7 +1951,8 @@ enum UsageMath {
                 model: Pricing.shortName(mainLast.model),
                 contextTokens: mainLast.contextTokens,
                 costToday: a.costToday,
-                tokensToday: a.tokensToday
+                tokensToday: a.tokensToday,
+                accountSourceKey: mainLast.accountSourceKey
             ))
         }
         return Array(out.sorted { $0.contextTokens > $1.contextTokens }.prefix(5))
@@ -2221,6 +2296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func changeProvider(_ provider: UsageProvider) {
         guard provider != dashboard.provider else { return }
         dashboard.provider = provider
+        dashboard.accountSourceKey = nil
         dashboard.snapshot = nil
         dashboard.updatedAt = nil
         if isPreview {
@@ -2438,7 +2514,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc private func refreshClicked() {
         if isPreview {
-            render(DashboardPreview.snapshot(provider: dashboard.provider), now: Date())
+            dashboard.refreshing = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self else { return }
+                self.render(DashboardPreview.snapshot(provider: self.dashboard.provider), now: Date())
+            }
         } else {
             refresh(forceLimits: true)
         }
@@ -3005,6 +3085,9 @@ if CommandLine.arguments.contains("--codex-probe") {
     let account = CodexAccount.shared.fetch(force: true)
     let local = CodexUsageReader().entries(since: Date().addingTimeInterval(-7 * 24 * 3600))
     print("limits=\(account.limits?.bars.count ?? 0) local_entries=\(local.count) local_tokens=\(local.reduce(0) { $0 + $1.totalTokens })")
+    for (kind, tokens) in Stats(entries: local).byCodexAccount {
+        print("local_\(kind.rawValue)_tokens=\(tokens)")
+    }
     for bar in account.limits?.bars ?? [] {
         print("\(bar.displayName) \(Int(bar.percent.rounded()))% \(bar.shortLabel)")
     }

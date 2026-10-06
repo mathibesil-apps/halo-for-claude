@@ -40,7 +40,12 @@ enum DashboardPreview {
                        inputTokens: 18000 + i * 1800, outputTokens: 2400,
                        cacheCreationTokens: 0, cacheReadTokens: 12000,
                        dedupeKey: "demo.\(i)", sessionId: "preview", cwd: "/sample/web-app",
-                       isSidechain: false, provider: provider)
+                       isSidechain: false, provider: provider,
+                       codexAccountKind: provider == .codex ? (i % 3 == 0 ? .managed : .personal) : nil,
+                       accountSourceKey: args.contains("--single-account") ? "preview:single"
+                           : provider == .codex
+                               ? (i % 3 == 0 ? "codex:managed" : "codex:personal")
+                               : (i % 3 == 0 ? "claude:preview-b" : "claude:preview-a"))
         }
         let today = Stats(entries: entries)
         return Snapshot(
@@ -50,11 +55,15 @@ enum DashboardPreview {
             today: today, week: Stats(entries: entries + entries + entries),
             sessions: [
                 SessionSummary(id: "preview.web-app", project: "web-app", model: provider == .codex ? "Astra" : "Sonnet",
-                               contextTokens: 84000, costToday: 1.84, tokensToday: 248000),
+                               contextTokens: 84000, costToday: 1.84, tokensToday: 248000,
+                               accountSourceKey: args.contains("--single-account") ? "preview:single"
+                                   : provider == .codex ? "codex:managed" : "claude:preview-b"),
                 SessionSummary(id: "preview.api-server", project: args.contains("--stress")
                                ? "a-project-with-a-very-long-name-that-must-wrap-without-hiding-its-model" : "api-server",
                                model: provider == .codex ? "Sol" : "Haiku",
-                               contextTokens: 42000, costToday: 0.92, tokensToday: 156000)
+                               contextTokens: 42000, costToday: 0.92, tokensToday: 156000,
+                               accountSourceKey: args.contains("--single-account") ? "preview:single"
+                                   : provider == .codex ? "codex:personal" : "claude:preview-a")
             ],
             insights: [Insight(severity: .warn, text: "\(provider == .codex ? "Spark" : "Claude") is approaching its 5-hour limit. The next reset will restore capacity.")],
             hourCosts: (0..<24).map { Double(($0 * 7 + 3) % 13) * (provider == .codex ? 8200 : 0.18) },

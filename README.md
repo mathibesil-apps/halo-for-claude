@@ -62,7 +62,12 @@ in common CLI locations. Set `CODEX_CLI_PATH` when using a custom installation.
 Detailed project/model statistics come from local rollout logs in
 `~/.codex/sessions` and `~/.codex/archived_sessions`. Codex cached input is a
 subset of input tokens, so Halo displays it separately without counting it
-twice.
+twice. When local sessions come from more than one account source, Halo adds
+numbered account tabs that separately filter totals, charts, models, and active
+sessions. It uses only each rollout's `session_meta.model_provider`; provider
+names are not displayed, and account identifiers and credentials are never
+read. Plan-limit rings and account summaries are labeled separately because
+they belong to the current ChatGPT login used by the installed Codex process.
 
 ### Claude Code
 
@@ -79,12 +84,17 @@ If there is no usable Claude Code login, **Connect to Claude…** starts the OAu
 flow and stores Halo's own grant in its Keychain item. Disconnecting never
 removes Claude Code's login.
 
+Claude account tabs use an in-memory SHA-256 digest of the `accountUuid` already
+present in local session logs. The original identifier is never displayed,
+stored by Halo, or included in diagnostics.
+
 ## What you get
 
 - Full-width limit bars with readable percentages, remaining capacity, and reset times.
 - Dynamic model limits and model breakdowns.
 - Current five-hour activity, burn rate, input/output/cache totals.
 - Today and last-seven-days local totals by project and model.
+- Numbered account-source tabs for local Claude and Codex activity, including separate model totals.
 - Codex account lifetime, peak-day, streak, and longest-turn summaries.
 - Notifications at 80% and 95%, projected exhaustion, unused capacity before a
   reset, and completed resets.
@@ -112,8 +122,9 @@ it does not print credentials, account identifiers, prompts, or project names.
   are not reparsed.
 - **Worst limit only** is the compact menu bar default. Choose **All limits** in
   settings to show every ring there; the dashboard always includes every limit.
-- Refresh is available at the bottom of the dashboard or with **⌘R**. The footer
-  shows refresh progress; unavailable, estimated, and saved limits are labeled.
+- Refresh is available at the bottom of the dashboard or with **⌘R**. Its icon
+  spins while updating and briefly confirms completion; unavailable, estimated,
+  and saved limits are labeled.
 - Demo mode anonymizes project names:
   `defaults write com.mathiasbesil.halo demoMode -bool true`.
 
